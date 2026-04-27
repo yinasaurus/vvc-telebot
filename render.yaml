@@ -1,0 +1,34 @@
+# Render Blueprint: Background Worker for Telegram long-polling.
+# Deploy: Dashboard → New → Blueprint → connect this repo.
+#
+# Background workers do NOT support Render's "Free" instance type — use Starter or higher.
+# https://render.com/docs/yaml-spec
+
+services:
+  - type: worker
+    name: vvc-telebot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    # Keeps verified_users.json across deploys (set VERIFIED_USERS_PATH to match).
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: VERIFIED_USERS_PATH
+        value: /var/data/verified_users.json
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: BOT_PASSCODE
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      # Paste the full JSON from Google (multiline secret in Render dashboard).
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: CCA_OPTIONS
+        sync: false

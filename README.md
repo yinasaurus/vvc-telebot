@@ -131,7 +131,8 @@ Copy `.env.example` to `.env` and fill in:
 | `BOT_PASSCODE` | Shared unlock code (**≥ 12 characters**) |
 | `ADMIN_TELEGRAM_IDS` | Comma-separated numeric Telegram user ids |
 | `GOOGLE_SHEET_ID` | Spreadsheet id from the Google Sheet URL |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the service account JSON key file |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the service account JSON file (local / file on disk) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional. Entire JSON body as one env value (use on Render instead of a file). If set, it overrides the file. |
 | `CCA_OPTIONS` | Optional. Comma-separated labels (e.g. `Drama,Choir`). If set, **New request** shows buttons instead of asking for typed CCA. Avoid names that match menu labels like `Return an item`. |
 | `VERIFIED_USERS_PATH` | Optional. Absolute path for `verified_users.json` on a server with a **persistent disk** (see hosting below). |
 
@@ -154,36 +155,41 @@ Keep the process running for the bot to stay online (your laptop, a VPS, or a ho
 
 ## Hosting 24/7 (Railway or Render)
 
-These platforms **sleep** or **rotate disks** by default; Telegram bots need a **long-running process** and a **stable** `verified_users.json` if you do not want members to re-enter the passcode after every deploy.
+Telegram needs a **single long-running process** (`python bot.py`). Prefer **one** deployment.
 
 ### General
 
-1. Push the repo to GitHub (without `.env` or keys).
-2. Create a new project and connect the repo.
-3. Set **build**: `pip install -r requirements.txt`
-4. Set **start command**: `python bot.py` (this repo includes a `Procfile` with `worker: python bot.py` for platforms that read it).
-5. Copy every variable from your local `.env` into the host’s **environment variables** (same names).
-6. Upload **`service_account.json`** securely: many hosts let you paste file contents in a secret, or mount it — point `GOOGLE_SERVICE_ACCOUNT_FILE` at that path.
+1. Push the repo to GitHub (no `.env`, no `service_account.json`, no `verified_users.json`).
+2. Build: `pip install -r requirements.txt` · Start: `python bot.py` (see also `Procfile`).
+3. Copy env vars from `.env`. For Google credentials you can either:
+   - **`GOOGLE_SERVICE_ACCOUNT_JSON`** — paste the **full** service account JSON (recommended on Render), or  
+   - **`GOOGLE_SERVICE_ACCOUNT_FILE`** — path to the JSON file on disk (typical locally).
 
 ### Railway
 
 1. [railway.app](https://railway.app) → New Project → Deploy from GitHub.
-2. Add **Variables** for `TELEGRAM_BOT_TOKEN`, `BOT_PASSCODE`, `ADMIN_TELEGRAM_IDS`, `GOOGLE_SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_FILE`, optional `CCA_OPTIONS`, etc.
-3. For `service_account.json`, use **Railway’s file mount / variable** pattern or commit a path under a mounted volume (do **not** commit the JSON to GitHub).
-4. Optional **Volume**: mount e.g. `/data` and set `VERIFIED_USERS_PATH=/data/verified_users.json` so unlocks survive redeploys.
-5. Start command: `python bot.py` (or rely on `Procfile` **worker** process type if the UI offers it).
+2. Set variables; mount a volume if needed and point **`VERIFIED_USERS_PATH`** at a file on that volume.
+3. Start command: `python bot.py`.
 
-### Render
+### Render (step-by-step)
 
-1. [render.com](https://render.com) → New → **Background Worker** (not a Web Service — this bot uses **polling**, not HTTP).
-2. Connect the repo; build command `pip install -r requirements.txt`; start command `python bot.py`.
-3. Add the same env vars as locally.
-4. Free tier may **spin down** or be unsuitable for always-on bots; check current Render policies. Consider a paid worker or another VPS if the bot must never stop.
-5. If Render provides a **persistent disk**, attach it and set `VERIFIED_USERS_PATH` to a file on that disk.
+Render’s Blueprint spec: **background workers cannot use the “Free” instance type** — you need at least **Starter** (check [current pricing](https://render.com/pricing)).
+
+1. Push this repo to GitHub.
+2. In [render.com](https://render.com) → **New** → **Blueprint** (or **Background Worker** from repo).
+3. Connect the repo. If you use the included **`render.yaml`**, Render will propose a **Worker** with a small **persistent disk** at `/var/data` and **`VERIFIED_USERS_PATH=/var/data/verified_users.json`** (so passcode unlocks survive redeploys).
+4. **Environment variables** (set in the dashboard; mark secrets appropriately):
+   - `TELEGRAM_BOT_TOKEN`, `BOT_PASSCODE`, `ADMIN_TELEGRAM_IDS`, `GOOGLE_SHEET_ID`
+   - **`GOOGLE_SERVICE_ACCOUNT_JSON`** — open your local `service_account.json`, copy **all** of it, paste into one secret (multiline). You do **not** need to upload the file if this is set.
+   - Optional: `CCA_OPTIONS`
+5. **Do not** create a **Web Service** for this bot — it does not listen on HTTP. Use a **Background Worker**.
+6. Deploy and watch **Logs**. If the worker crashes on boot, check env vars and that the Sheet is shared with the service account email from the JSON.
+
+`runtime.txt` pins the Python version for Render’s Python runtime.
 
 ### Why `VERIFIED_USERS_PATH` matters
 
-On many hosts the filesystem is **ephemeral**: each deploy wipes `verified_users.json`. Setting `VERIFIED_USERS_PATH` to a **mounted volume** path keeps “already unlocked” users across deploys.
+Ephemeral disks wipe files on redeploy. Use a **mounted disk** path (as in `render.yaml`) or members will need to enter the passcode again after each deploy.
 
 ---
 

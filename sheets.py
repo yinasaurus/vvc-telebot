@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 
 import gspread
+import config
 from google.oauth2.service_account import Credentials
 
 SCOPES = [
@@ -134,7 +135,12 @@ def _migrate_legacy_sheet(ws: gspread.Worksheet, all_vals: list[list[str]]) -> N
 
 
 def _client(credentials_path: str) -> gspread.Client:
-    creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
+    if config.SERVICE_ACCOUNT_INFO is not None:
+        creds = Credentials.from_service_account_info(
+            config.SERVICE_ACCOUNT_INFO, scopes=SCOPES
+        )
+    else:
+        creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
     return gspread.authorize(creds)
 
 

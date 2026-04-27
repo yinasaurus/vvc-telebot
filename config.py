@@ -1,5 +1,7 @@
+import json
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -31,6 +33,20 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
     "GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json"
 ).strip()
 
+# Optional: full service account JSON (for Render etc.) — avoids committing a file.
+_raw_sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+SERVICE_ACCOUNT_INFO: dict[str, Any] | None = None
+SERVICE_ACCOUNT_JSON_ERROR: str | None = None
+if _raw_sa_json:
+    try:
+        parsed = json.loads(_raw_sa_json)
+        if isinstance(parsed, dict):
+            SERVICE_ACCOUNT_INFO = parsed
+        else:
+            SERVICE_ACCOUNT_JSON_ERROR = "GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON object"
+    except json.JSONDecodeError as e:
+        SERVICE_ACCOUNT_JSON_ERROR = f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {e}"
+
 # Comma-separated CCA names → tap-to-pick instead of typing (optional).
 CCA_OPTIONS = _parse_cca_options(os.environ.get("CCA_OPTIONS"))
 
@@ -56,7 +72,15 @@ def validate_config() -> list[str]:
         errors.append("ADMIN_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
     if not GOOGLE_SHEET_ID:
         errors.append("GOOGLE_SHEET_ID is missing")
-    p = Path(GOOGLE_SERVICE_ACCOUNT_FILE)
-    if not p.is_file():
-        errors.append(f"GOOGLE_SERVICE_ACCOUNT_FILE not found: {p.resolve()}")
+    if SERVICE_ACCOUNT_JSON_ERROR:
+        errors.append(SERVICE_ACCOUNT_JSON_ERROR)
+    elif SERVICE_ACCOUNT_INFO is not None:
+        pass
+    elif Path(GOOGLE_SERVICE_ACCOUNT_FILE).is_file():
+        pass
+    else:
+        errors.append(
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON (paste full JSON in env) or place "
+            f"GOOGLE_SERVICE_ACCOUNT_FILE at {Path(GOOGLE_SERVICE_ACCOUNT_FILE).resolve()}"
+        )
     return errors
