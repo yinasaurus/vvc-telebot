@@ -131,6 +131,43 @@ FORMAT_HELP = (
     "Example: HDMI cable, 2, Year-end concert booth"
 )
 
+# When CCA_OPTIONS is set in .env, users pick CCA from buttons instead of typing.
+CCA_CANCEL_LABEL = "« Cancel"
+
+
+def _cca_pick_keyboard() -> ReplyKeyboardMarkup:
+    opts = list(config.CCA_OPTIONS)
+    rows: list[list[KeyboardButton]] = []
+    for i in range(0, len(opts), 2):
+        row = [KeyboardButton(opts[i])]
+        if i + 1 < len(opts):
+            row.append(KeyboardButton(opts[i + 1]))
+        rows.append(row)
+    rows.append([KeyboardButton(CCA_CANCEL_LABEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _fmt_need_row(t: dict[str, str]) -> str:
+    i, q, r = (
+        t.get("need_item", "").strip(),
+        t.get("need_qty", "").strip(),
+        t.get("need_reason", "").strip(),
+    )
+    if i or q or r:
+        return f"Need: {i} × {q} — {r}"
+    return "Need: (empty)"
+
+
+def _fmt_loan_row(t: dict[str, str]) -> str:
+    i, q, r = (
+        t.get("loan_item", "").strip(),
+        t.get("loan_qty", "").strip(),
+        t.get("loan_reason", "").strip(),
+    )
+    if i or q or r:
+        return f"Loaned: {i} × {q} — {r}"
+    return "Loaned: (pending)"
+
 # Wrong passcode lockout (in-memory; resets on bot restart)
 _MAX_PASS_FAILS = 5
 _LOCKOUT_SEC = 15 * 60
@@ -172,6 +209,84 @@ def _main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
+def _cca_help_sentence() -> str:
+    if config.CCA_OPTIONS:
+        return (
+            "When you tap New request, you pick your CCA from buttons (no need to type the name).\n"
+        )
+    return (
+        "When you tap New request, the bot will ask which CCA — reply with one short line "
+        "(e.g. your group name).\n"
+    )
+
+
+def _help_text(*, include_admin: bool) -> str:
+    lines = [
+        "HOW TO USE THIS BOT",
+        "",
+        "What it does",
+        "Loan requests and returns are logged to a Google Sheet: who asked, what went out, "
+        "when both sides confirmed, and when gear came back.",
+        "",
+        "Commands",
+        "/start — Intro and keyboard (after you unlock)",
+        "/help — This full guide",
+        "/admin — Logistics shortcuts only (admins)",
+        "",
+        "Borrower workflow",
+        "1) Unlock — First time here: send the shared passcode (only in this private chat). "
+        "Your Telegram account stays unlocked on this server.",
+        "",
+        "2) New request — Say what you need in exactly one line:",
+        "   item, qty, reason",
+        "   Example: HDMI cable, 2, Year-end concert booth",
+        "",
+        _cca_help_sentence(),
+        "",
+        "3) Logistics enters what they actually loaned; then you open My loans.",
+        "",
+        '4) Tap Sign / acknowledge — that confirms you received the items (your "signature" on the log).',
+        "",
+        "5) Return an item — When you're bringing gear back; logistics approves to close the loan.",
+        "",
+        "Tips",
+        "• If the format is wrong, the bot sends the template again.",
+        "• Use the buttons at the bottom of the chat — they're faster than typing commands.",
+    ]
+    if include_admin:
+        lines.extend(
+            [
+                "",
+                "— Logistics (you are an admin) —",
+                "• Admin: pending loans — Pick a request, then send item, qty, reason for what you handed out.",
+                "• Admin: pending returns — Approve when the item is physically back.",
+                "Use /admin for a shorter reminder.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        try:
+            await update.message.reply_text("Use /help in a private chat with this bot.")
+        except TelegramError:
+            logger.exception("cmd_help: non-private reply failed")
+        return
+    uid = update.effective_user.id
+    verified = _verified(context, uid)
+    text = _help_text(include_admin=_is_admin(uid))
+    try:
+        await update.message.reply_text(
+            text,
+            reply_markup=_main_keyboard(uid) if verified else None,
+        )
+    except TelegramError:
+        logger.exception("cmd_help: reply failed")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -183,20 +298,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     uid = update.effective_user.id
     if _verified(context, uid):
+        intro = (
+            "You're unlocked — welcome back.\n\n"
+            "Quick reminder: New request → logistics records the loan → you Sign / acknowledge "
+            "under My loans → Return an item when done.\n\n"
+            "Send /help for the full step-by-step guide."
+        )
         try:
             await update.message.reply_text(
-                "You are already unlocked. Use the menu below.",
+                intro,
                 reply_markup=_main_keyboard(uid),
             )
         except TelegramError:
             logger.exception("cmd_start: reply failed")
         return
+    welcome = (
+        "Welcome to the loan bot.\n\n"
+        "It tracks equipment loans in a shared Google Sheet (requests, approvals, signatures, returns). "
+        "Only people with the passcode can use it.\n\n"
+        "Next step: send the shared passcode as your next message right here "
+        "(private chat only — not in groups).\n\n"
+        "After this Telegram account unlocks once on this server, you won't need the passcode again.\n\n"
+        "Send /help anytime for a full how-to (even before unlocking)."
+    )
     try:
-        await update.message.reply_text(
-            "Welcome. This bot is private. Send the shared passcode as your next message "
-            "(not in a group). Each Telegram account unlocks once on this server; "
-            "after that you do not need to enter it again."
-        )
+        await update.message.reply_text(welcome)
     except TelegramError:
         logger.exception("cmd_start: welcome reply failed")
 
@@ -268,8 +394,10 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     try:
         await update.message.reply_text(
-            "Unlocked. Use the buttons below to log requests, see your loans, or start a return. "
-            "Admins get extra buttons for approvals.",
+            "Unlocked.\n\n"
+            "Use the bottom buttons: New request, My loans, Return an item. "
+            "Admins also see Admin: pending loans / pending returns.\n\n"
+            "Send /help for how the whole flow works (sheet logging, Sign / acknowledge, returns).",
             reply_markup=_main_keyboard(uid),
         )
     except TelegramError:
@@ -287,10 +415,14 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         await update.message.reply_text(
-        "Admin shortcuts:\n"
-        "• Buttons: Admin: pending loans / Admin: pending returns\n"
-        "• After you tap a pending loan, send one message: item, qty, reason (same format as members).\n"
-        "• After you tap a pending return, approve with the button to mark returned."
+            "Admin — how approvals work:\n\n"
+            "1) Pending loans = someone requested gear. You pick a row, then send "
+            "item, qty, reason — that records what you actually handed out (approves the loan on our side).\n\n"
+            "2) The borrower then opens My loans and taps Sign / acknowledge — that is their "
+            '"signature" that they received it.\n\n'
+            "3) Pending returns = borrower started a return. Tap Approve return when the "
+            "physical item is back.\n\n"
+            "Buttons: Admin: pending loans / Admin: pending returns"
         )
     except TelegramError:
         logger.exception("cmd_admin: help reply failed")
@@ -319,11 +451,39 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.pop("flow", None)
         context.user_data.pop("pending_cca", None)
 
+    if (
+        context.user_data.get("flow") == USER_FLOW_CCA
+        and config.CCA_OPTIONS
+        and text == CCA_CANCEL_LABEL
+    ):
+        context.user_data.pop("flow", None)
+        context.user_data.pop("pending_cca", None)
+        try:
+            await update.message.reply_text(
+                "Cancelled.",
+                reply_markup=_main_keyboard(uid),
+            )
+        except TelegramError:
+            logger.exception("handle_user_text: CCA cancel reply failed")
+        return
+
     if text == "New request":
         context.user_data["flow"] = USER_FLOW_CCA
-        await update.message.reply_text(
-            "What CCA is this for? Reply with one line (name of the CCA or group)."
-        )
+        if config.CCA_OPTIONS:
+            try:
+                await update.message.reply_text(
+                    "Pick your CCA below (or Cancel).",
+                    reply_markup=_cca_pick_keyboard(),
+                )
+            except TelegramError:
+                logger.exception("handle_user_text: New request CCA keyboard failed")
+        else:
+            try:
+                await update.message.reply_text(
+                    "What CCA is this for? Reply with one line (name of the CCA or group)."
+                )
+            except TelegramError:
+                logger.exception("handle_user_text: New request free CCA failed")
         return
     if text == "My loans":
         await show_my_loans(update, context, uid)
@@ -351,7 +511,6 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.exception("handle_user_text: loan format reply failed")
             return
         item, qty, reason = parsed_loan
-        loan_line = f"{item} | qty {qty} | {reason}"
         tx_id = context.user_data["expect_loan_for"]
         now = sheets.now_iso()
         try:
@@ -361,7 +520,9 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 SHEET,
                 tx_id,
                 {
-                    "loan_description": loan_line,
+                    "loan_item": item,
+                    "loan_qty": qty,
+                    "loan_reason": reason,
                     "admin_tg_id": str(uid),
                     "admin_username": u.username or "",
                     "loan_recorded_at": now,
@@ -378,7 +539,9 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             if ok:
                 await update.message.reply_text(
-                    f"Recorded loan for `{tx_id}`. The requester must acknowledge under My loans.",
+                    f"Loan approved on file for `{tx_id}`.\n\n"
+                    "Tell the borrower to open My loans and tap Acknowledge "
+                    '(their "signature" that they received the items).',
                     parse_mode="Markdown",
                 )
             else:
@@ -389,11 +552,21 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     flow = context.user_data.get("flow")
     if flow == USER_FLOW_CCA:
+        if config.CCA_OPTIONS and text not in config.CCA_OPTIONS:
+            try:
+                await update.message.reply_text(
+                    "Pick one of the CCA buttons above, or tap « Cancel.",
+                    reply_markup=_cca_pick_keyboard(),
+                )
+            except TelegramError:
+                logger.exception("handle_user_text: invalid CCA pick reply failed")
+            return
         context.user_data["pending_cca"] = text
         context.user_data["flow"] = USER_FLOW_DESC
         try:
             await update.message.reply_text(
-                f"What do you need to borrow? Send one message in this format:\n{FORMAT_HELP}"
+                f"What do you need to borrow? Send one message:\n{FORMAT_HELP}",
+                reply_markup=_main_keyboard(uid),
             )
         except TelegramError:
             logger.exception("handle_user_text: flow CCA reply failed")
@@ -411,7 +584,6 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.exception("handle_user_text: format error reply failed")
             return
         item, qty, reason = parsed
-        need_description = f"{item} | qty {qty} | {reason}"
         cca = context.user_data.get("pending_cca", "")
         tx_id = uuid.uuid4().hex
         try:
@@ -424,7 +596,9 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 requester_username=u.username or "",
                 requester_display_name=u.full_name or "",
                 cca=cca,
-                need_description=need_description,
+                need_item=item,
+                need_qty=qty,
+                need_reason=reason,
             )
         except SheetsBackendError:
             try:
@@ -447,7 +621,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     try:
-        await update.message.reply_text("Use the menu buttons or /start.")
+        await update.message.reply_text("Use the menu buttons, or send /help for instructions.")
     except TelegramError:
         logger.exception("handle_user_text: default hint reply failed")
 
@@ -488,21 +662,26 @@ async def show_my_loans(
         sid = t["id"]
         st = t.get("status", "")
         lines.append(
-            f"• `{sid}` [{st}]\n  CCA: {t.get('cca','')}\n  Need: {t.get('need_description','')}\n"
-            f"  Loaned: {t.get('loan_description','(pending)')}"
+            f"• `{sid}` [{st}]\n  CCA: {t.get('cca','')}\n"
+            f"  {_fmt_need_row(t)}\n"
+            f"  {_fmt_loan_row(t)}"
         )
         if st == sheets.STATUS_AWAITING_ACK:
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        f"Acknowledge {sid[:6]}…",
+                        f"Sign / acknowledge {sid[:6]}…",
                         callback_data=f"ack:{sid}",
                     )
                 ]
             )
+    header = (
+        "Your loans — if status is awaiting_user_ack, tap Sign / acknowledge to confirm "
+        "you received what logistics recorded.\n\n"
+    )
     await _reply_markdown_safe(
         update.message,
-        "\n\n".join(lines) or "Nothing to show.",
+        header + ("\n\n".join(lines) or "Nothing to show."),
         reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
     )
 
@@ -586,9 +765,10 @@ async def admin_pending_loans(
     ]
     try:
         await update.message.reply_text(
-            "Choose a request. Your next message records what was loaned — use:\n"
+            "Approve by recording what you actually handed out.\n"
+            "Pick a request, then send one line:\n"
             "item, qty, reason\n"
-            "(same rule as borrower requests).",
+            "(same format as borrowers). That moves it to awaiting their acknowledgement.",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except TelegramError:
@@ -631,7 +811,8 @@ async def admin_pending_returns(
         )
     try:
         await update.message.reply_text(
-            "Approve a return to mark it returned with a timestamp.",
+            "When the physical item is back with you, approve the return below "
+            "(logs time and your Telegram id on the sheet).",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except TelegramError:
@@ -689,7 +870,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except SheetsBackendError:
             await _edit_callback_message(q, SHEET_ERROR_TEXT)
             return
-        await _edit_callback_message(q, "Acknowledged. Status is now on loan.")
+        await _edit_callback_message(
+            q,
+            "Signed — acknowledgement saved. Status is now on loan.",
+        )
         return
 
     if data.startswith("rtn:"):
@@ -780,6 +964,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(

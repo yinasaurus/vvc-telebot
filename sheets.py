@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 import gspread
@@ -12,9 +13,36 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-_END_COL = "R"  # 18 columns A–R, keep in sync with len(HEADERS)
+# 22 columns A–V, keep in sync with len(HEADERS)
+_END_COL = "V"
 
 HEADERS = [
+    "id",
+    "created_at",
+    "updated_at",
+    "requester_tg_id",
+    "requester_username",
+    "requester_display_name",
+    "cca",
+    "need_item",
+    "need_qty",
+    "need_reason",
+    "status",
+    "loan_item",
+    "loan_qty",
+    "loan_reason",
+    "admin_tg_id",
+    "admin_username",
+    "loan_recorded_at",
+    "user_ack_at",
+    "return_requested_at",
+    "return_approved_at",
+    "return_approver_tg_id",
+    "return_approver_username",
+]
+
+# Previous schema (single need_description + loan_description); auto-migrated on startup.
+LEGACY_HEADERS_V1 = [
     "id",
     "created_at",
     "updated_at",
@@ -46,6 +74,65 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def split_pipe_triple(s: str) -> tuple[str, str, str]:
+    """Parse stored lines like: item | qty 2 | reason text"""
+    s = (s or "").strip()
+    if not s:
+        return "", "", ""
+    m = re.match(r"^(.*?) \| qty (.+?) \| (.+)$", s, re.DOTALL)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    return s, "", ""
+
+
+def _migrate_legacy_data_row(row: list[str]) -> list[str]:
+    r = list(row)
+    while len(r) < 18:
+        r.append("")
+    r = r[:18]
+    ni, nq, nr = split_pipe_triple(r[7])
+    li, lq, lr = split_pipe_triple(r[9])
+    return [
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        ni,
+        nq,
+        nr,
+        r[8],
+        li,
+        lq,
+        lr,
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15],
+        r[16],
+        r[17],
+    ]
+
+
+def _migrate_legacy_sheet(ws: gspread.Worksheet, all_vals: list[list[str]]) -> None:
+    new_rows: list[list[str]] = [HEADERS]
+    for row in all_vals[1:]:
+        if not row or not row[0]:
+            continue
+        new_rows.append(_migrate_legacy_data_row(row))
+    ws.clear()
+    if new_rows:
+        ws.update(
+            f"A1:{_END_COL}{len(new_rows)}",
+            new_rows,
+            value_input_option="USER_ENTERED",
+        )
+
+
 def _client(credentials_path: str) -> gspread.Client:
     creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
     return gspread.authorize(creds)
@@ -66,12 +153,16 @@ def ensure_headers(credentials_path: str, sheet_id: str) -> None:
     row1 = all_vals[0]
     if row1 == HEADERS:
         return
+    if row1 == LEGACY_HEADERS_V1:
+        _migrate_legacy_sheet(ws, all_vals)
+        return
     if len(all_vals) == 1 and not any(row1):
         ws.update(f"A1:{_END_COL}1", [HEADERS], value_input_option="USER_ENTERED")
         return
     raise RuntimeError(
         "Row 1 of the Google Sheet must be the bot header row. "
-        "Use a new sheet or fix row 1 to match the documented columns."
+        "Expected current columns or the legacy 18-column layout (auto-migrated). "
+        "Use a fresh sheet or fix row 1."
     )
 
 
@@ -84,7 +175,9 @@ def append_request(
     requester_username: str,
     requester_display_name: str,
     cca: str,
-    need_description: str,
+    need_item: str,
+    need_qty: str,
+    need_reason: str,
 ) -> None:
     ensure_headers(credentials_path, sheet_id)
     ws = _ws(credentials_path, sheet_id)
@@ -97,17 +190,21 @@ def append_request(
         requester_username,
         requester_display_name,
         cca,
-        need_description,
+        need_item,
+        need_qty,
+        need_reason,
         STATUS_PENDING_ADMIN,
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
+        "",  # loan_item
+        "",  # loan_qty
+        "",  # loan_reason
+        "",  # admin_tg_id
+        "",  # admin_username
+        "",  # loan_recorded_at
+        "",  # user_ack_at
+        "",  # return_requested_at
+        "",  # return_approved_at
+        "",  # return_approver_tg_id
+        "",  # return_approver_username
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -173,5 +270,3 @@ def update_transaction(
         value_input_option="USER_ENTERED",
     )
     return True
-
-

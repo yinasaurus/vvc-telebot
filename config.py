@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_cca_options(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 def _parse_admin_ids(raw: str | None) -> set[int]:
     if not raw:
         return set()
@@ -25,7 +31,15 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
     "GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json"
 ).strip()
 
-VERIFIED_USERS_PATH = Path(__file__).resolve().parent / "verified_users.json"
+# Comma-separated CCA names → tap-to-pick instead of typing (optional).
+CCA_OPTIONS = _parse_cca_options(os.environ.get("CCA_OPTIONS"))
+
+_verified_override = os.environ.get("VERIFIED_USERS_PATH", "").strip()
+VERIFIED_USERS_PATH = (
+    Path(_verified_override)
+    if _verified_override
+    else Path(__file__).resolve().parent / "verified_users.json"
+)
 
 
 def validate_config() -> list[str]:
