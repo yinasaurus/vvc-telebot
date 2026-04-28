@@ -12,6 +12,7 @@ from telegram import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.error import BadRequest, TelegramError
@@ -315,6 +316,7 @@ def _help_text(*, include_admin: bool) -> str:
         "",
         "Commands",
         "/start — Intro and keyboard (after you unlock)",
+        "/reset — Clear current flow and refresh buttons",
         "/help — This full guide",
         "/whoami — Show your Telegram ID and role",
         "/status <tx_id> — Show one transaction status",
@@ -410,6 +412,27 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     except TelegramError:
         logger.exception("cmd_whoami: reply failed")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-clear local flow state and show the right keyboard."""
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    context.user_data.pop("flow", None)
+    context.user_data.pop("pending_group", None)
+    context.user_data.pop("pending_cca", None)
+    context.user_data.pop("expect_loan_for", None)
+    if _verified(context, uid):
+        await update.message.reply_text(
+            "State reset. Use the menu below.",
+            reply_markup=_main_keyboard(uid),
+        )
+    else:
+        await update.message.reply_text(
+            "State reset. Session is locked, send passcode to unlock.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -623,6 +646,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("cmd_start: non-private reply failed")
         return
     uid = update.effective_user.id
+    # Always clear partial flow on /start so reopening chat feels clean.
+    context.user_data.pop("flow", None)
+    context.user_data.pop("pending_group", None)
+    context.user_data.pop("pending_cca", None)
+    context.user_data.pop("expect_loan_for", None)
     if _verified(context, uid):
         intro = (
             "You're unlocked — welcome back.\n\n"
@@ -649,7 +677,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send /help anytime for a full how-to (even before unlocking)."
     )
     try:
-        await update.message.reply_text(welcome)
+        await update.message.reply_text(
+            welcome,
+            reply_markup=ReplyKeyboardRemove(),
+        )
     except TelegramError:
         logger.exception("cmd_start: welcome reply failed")
 
@@ -1468,6 +1499,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("status", cmd_status))

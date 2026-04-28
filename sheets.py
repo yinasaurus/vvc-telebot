@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import gspread
 import config
@@ -85,7 +85,8 @@ ADMIN_AUDIT_HEADERS = [
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    sgt = timezone(timedelta(hours=8))
+    return datetime.now(sgt).strftime("%Y-%m-%d %H:%M:%S UTC+8")
 
 
 def split_pipe_triple(s: str) -> tuple[str, str, str]:
