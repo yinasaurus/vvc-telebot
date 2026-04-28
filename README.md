@@ -9,7 +9,7 @@ Use this in **private chat** with the bot (not groups).
 ## How it works (big picture)
 
 1. **Borrower** unlocks the bot with a shared passcode (session-based).
-2. **Borrower** creates a **New request**: pick or type **CCA**, then send **item, qty, reason** (see format below). If `CCA_OPTIONS` is set in `.env`, CCAs appear as **buttons** instead of typing.
+2. **Borrower** creates a **New request**: pick **Group** and **Club** from buttons, then send **item, qty, reason** (see format below).
 3. A new row appears in the sheet with status **pending_admin**.
 4. **Admin** (logistics) opens **Admin: pending loans**, picks the request, and sends **what was actually loaned** in the same structured format.
 5. The sheet updates; status becomes **awaiting_user_ack**, with timestamps and admin Telegram identity recorded.
@@ -104,6 +104,8 @@ Row 1 must match the bot headers (created automatically on an empty sheet). **Ol
 | `return_approved_at` | When logistics approved return |
 | `return_approver_*` | Who approved the return |
 
+The bot also maintains a second worksheet named **`collated_logs`** that aggregates total requested quantities by item across all requests.
+
 ---
 
 ## Who can do what
@@ -133,7 +135,6 @@ Copy `.env.example` to `.env` and fill in:
 | `GOOGLE_SHEET_ID` | Spreadsheet id from the Google Sheet URL |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the service account JSON file (local / file on disk) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional. Entire JSON body as one env value (use on Render instead of a file). If set, it overrides the file. |
-| `CCA_OPTIONS` | Optional. Comma-separated labels (e.g. `Drama,Choir`). If set, **New request** shows buttons instead of asking for typed CCA. Avoid names that match menu labels like `Return an item`. |
 | `SESSION_TTL_MINUTES` | Optional. Session timeout in minutes. After inactivity, passcode is required again. |
 
 Share the Google Sheet with the **service account email** (`client_email` inside the JSON) as **Editor**.
@@ -181,7 +182,7 @@ Render’s Blueprint spec: **background workers cannot use the “Free” instan
 4. **Environment variables** (set in the dashboard; mark secrets appropriately):
    - `TELEGRAM_BOT_TOKEN`, `BOT_PASSCODE`, `ADMIN_TELEGRAM_IDS`, `GOOGLE_SHEET_ID`
    - **`GOOGLE_SERVICE_ACCOUNT_JSON`** — open your local `service_account.json`, copy **all** of it, paste into one secret (multiline). You do **not** need to upload the file if this is set.
-   - Optional: `CCA_OPTIONS`
+   - Optional: `SESSION_TTL_MINUTES`
 5. **Do not** create a **Web Service** for this bot — it does not listen on HTTP. Use a **Background Worker**.
 6. Deploy and watch **Logs**. If the worker crashes on boot, check env vars and that the Sheet is shared with the service account email from the JSON.
 
@@ -199,7 +200,13 @@ Unlock is intentionally temporary. After `SESSION_TTL_MINUTES` of inactivity, me
 |---------|---------|
 | `/start` | Introduction, how it fits together; if not unlocked, asks for passcode |
 | `/help` | Full step-by-step guide (borrowers + admin section if you’re an admin) |
+| `/whoami` | Show your Telegram ID, role (admin/member), and session status |
+| `/status <tx_id>` | Show status/details of one transaction (admin: any, member: own only) |
+| `/cancelreq <tx_id>` | Cancel mistaken request before/while approval (not after on-loan/returned) |
+| `/editreq <tx_id>` | User-only edit flow: cancel own `pending_admin` request and immediately re-submit |
 | `/admin` | Short logistics reminder (admins only) |
+| `/adminlog` | Show latest admin audit entries (admins only) |
+| `/pending` | Queue summary counts (admins only) |
 
 ---
 

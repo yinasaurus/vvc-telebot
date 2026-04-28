@@ -1,17 +1,10 @@
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
-def _parse_cca_options(raw: str | None) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    return tuple(p.strip() for p in raw.split(",") if p.strip())
 
 
 def _parse_admin_ids(raw: str | None) -> set[int]:
@@ -57,16 +50,7 @@ if _raw_sa_json:
     except json.JSONDecodeError as e:
         SERVICE_ACCOUNT_JSON_ERROR = f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {e}"
 
-# Comma-separated CCA names → tap-to-pick instead of typing (optional).
-CCA_OPTIONS = _parse_cca_options(os.environ.get("CCA_OPTIONS"))
 SESSION_TTL_MINUTES = _parse_positive_int(os.environ.get("SESSION_TTL_MINUTES"), 30)
-
-_verified_override = os.environ.get("VERIFIED_USERS_PATH", "").strip()
-VERIFIED_USERS_PATH = (
-    Path(_verified_override)
-    if _verified_override
-    else Path(__file__).resolve().parent / "verified_users.json"
-)
 
 
 def validate_config() -> list[str]:

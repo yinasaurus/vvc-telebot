@@ -69,6 +69,19 @@ STATUS_AWAITING_ACK = "awaiting_user_ack"
 STATUS_ON_LOAN = "on_loan"
 STATUS_PENDING_RETURN = "pending_return"
 STATUS_RETURNED = "returned"
+STATUS_CANCELLED = "cancelled"
+COLLATED_SHEET_NAME = "collated_logs"
+COLLATED_HEADERS = ["item", "total_qty", "request_count", "updated_at"]
+ADMIN_AUDIT_SHEET_NAME = "admin_audit"
+ADMIN_AUDIT_HEADERS = [
+    "timestamp",
+    "action",
+    "tx_id",
+    "admin_tg_id",
+    "admin_username",
+    "admin_display_name",
+    "notes",
+]
 
 
 def now_iso() -> str:
@@ -213,6 +226,104 @@ def append_request(
         "",  # return_approver_username
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
+    refresh_collated_logs(credentials_path, sheet_id)
+
+
+def _parse_qty_number(raw: str) -> float:
+    m = re.search(r"[-+]?\d*\.?\d+", raw or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return 0.0
+
+
+def refresh_collated_logs(credentials_path: str, sheet_id: str) -> None:
+    txs = list_transactions(credentials_path, sheet_id)
+    agg: dict[str, dict[str, float | int | str]] = {}
+    for t in txs:
+        item = (t.get("need_item") or "").strip()
+        if not item:
+            continue
+        key = item.casefold()
+        rec = agg.setdefault(
+            key,
+            {"item": item, "total_qty": 0.0, "request_count": 0},
+        )
+        rec["request_count"] = int(rec["request_count"]) + 1
+        rec["total_qty"] = float(rec["total_qty"]) + _parse_qty_number(t.get("need_qty", ""))
+
+    rows: list[list[str]] = [COLLATED_HEADERS]
+    now = now_iso()
+    for rec in sorted(
+        agg.values(),
+        key=lambda r: (float(r["total_qty"]), int(r["request_count"])),
+        reverse=True,
+    ):
+        qty_val = float(rec["total_qty"])
+        qty_text = str(int(qty_val)) if qty_val.is_integer() else f"{qty_val:.2f}"
+        rows.append([str(rec["item"]), qty_text, str(rec["request_count"]), now])
+
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(COLLATED_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=COLLATED_SHEET_NAME, rows=1000, cols=6)
+    ws.clear()
+    end_row = max(1, len(rows))
+    ws.update(f"A1:D{end_row}", rows, value_input_option="USER_ENTERED")
+
+
+def append_admin_audit(
+    credentials_path: str,
+    sheet_id: str,
+    *,
+    action: str,
+    admin_tg_id: int,
+    admin_username: str,
+    admin_display_name: str,
+    tx_id: str = "",
+    notes: str = "",
+) -> None:
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(ADMIN_AUDIT_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=ADMIN_AUDIT_SHEET_NAME, rows=1000, cols=8)
+        ws.update("A1:G1", [ADMIN_AUDIT_HEADERS], value_input_option="USER_ENTERED")
+
+    row = [
+        now_iso(),
+        action,
+        tx_id,
+        str(admin_tg_id),
+        admin_username,
+        admin_display_name,
+        notes,
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def list_admin_audit(credentials_path: str, sheet_id: str) -> list[dict[str, str]]:
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(ADMIN_AUDIT_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return []
+    out: list[dict[str, str]] = []
+    for r in rows[1:]:
+        if not r:
+            continue
+        padded = r + [""] * max(0, len(ADMIN_AUDIT_HEADERS) - len(r))
+        out.append(dict(zip(ADMIN_AUDIT_HEADERS, padded[: len(ADMIN_AUDIT_HEADERS)])))
+    return out
 
 
 def _row_to_dict(row: list[str]) -> dict[str, str]:
