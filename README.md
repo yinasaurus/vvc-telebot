@@ -8,7 +8,7 @@ Use this in **private chat** with the bot (not groups).
 
 ## How it works (big picture)
 
-1. **Borrower** unlocks the bot with a shared passcode (once per Telegram account on each server).
+1. **Borrower** unlocks the bot with a shared passcode (session-based).
 2. **Borrower** creates a **New request**: pick or type **CCA**, then send **item, qty, reason** (see format below). If `CCA_OPTIONS` is set in `.env`, CCAs appear as **buttons** instead of typing.
 3. A new row appears in the sheet with status **pending_admin**.
 4. **Admin** (logistics) opens **Admin: pending loans**, picks the request, and sends **what was actually loaned** in the same structured format.
@@ -117,7 +117,7 @@ Row 1 must match the bot headers (created automatically on an empty sheet). **Ol
 **Passcode notes:**
 
 - Wrong guesses are counted; after **5** failures, that Telegram account waits **15 minutes** before trying again (in-memory; resets if the bot process restarts).
-- Unlocked users are saved in **`verified_users.json`** on the machine running the bot (gitignored).
+- Unlock is session-based: after inactivity (`SESSION_TTL_MINUTES`), users must enter passcode again.
 
 ---
 
@@ -134,11 +134,11 @@ Copy `.env.example` to `.env` and fill in:
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the service account JSON file (local / file on disk) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional. Entire JSON body as one env value (use on Render instead of a file). If set, it overrides the file. |
 | `CCA_OPTIONS` | Optional. Comma-separated labels (e.g. `Drama,Choir`). If set, **New request** shows buttons instead of asking for typed CCA. Avoid names that match menu labels like `Return an item`. |
-| `VERIFIED_USERS_PATH` | Optional. Absolute path for `verified_users.json` on a server with a **persistent disk** (see hosting below). |
+| `SESSION_TTL_MINUTES` | Optional. Session timeout in minutes. After inactivity, passcode is required again. |
 
 Share the Google Sheet with the **service account email** (`client_email` inside the JSON) as **Editor**.
 
-Never commit `.env`, `service_account.json`, or `verified_users.json`.
+Never commit `.env` or `service_account.json`.
 
 ---
 
@@ -149,7 +149,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Keep the process running for the bot to stay online (your laptop, a VPS, or a host like Railway/Fly.io). Prefer **one** running instance per deployment so `verified_users.json` stays consistent.
+Keep the process running for the bot to stay online (your laptop, a VPS, or a host like Railway/Fly.io). Prefer **one** running instance per deployment.
 
 ---
 
@@ -168,7 +168,7 @@ Telegram needs a **single long-running process** (`python bot.py`). Prefer **one
 ### Railway
 
 1. [railway.app](https://railway.app) → New Project → Deploy from GitHub.
-2. Set variables; mount a volume if needed and point **`VERIFIED_USERS_PATH`** at a file on that volume.
+2. Set variables and start command `python bot.py`.
 3. Start command: `python bot.py`.
 
 ### Render (step-by-step)
@@ -177,7 +177,7 @@ Render’s Blueprint spec: **background workers cannot use the “Free” instan
 
 1. Push this repo to GitHub.
 2. In [render.com](https://render.com) → **New** → **Blueprint** (or **Background Worker** from repo).
-3. Connect the repo. If you use the included **`render.yaml`**, Render will propose a **Worker** with a small **persistent disk** at `/var/data` and **`VERIFIED_USERS_PATH=/var/data/verified_users.json`** (so passcode unlocks survive redeploys).
+3. Connect the repo. If you use the included **`render.yaml`**, Render will propose a **Worker** with the correct build/start commands.
 4. **Environment variables** (set in the dashboard; mark secrets appropriately):
    - `TELEGRAM_BOT_TOKEN`, `BOT_PASSCODE`, `ADMIN_TELEGRAM_IDS`, `GOOGLE_SHEET_ID`
    - **`GOOGLE_SERVICE_ACCOUNT_JSON`** — open your local `service_account.json`, copy **all** of it, paste into one secret (multiline). You do **not** need to upload the file if this is set.
@@ -187,9 +187,9 @@ Render’s Blueprint spec: **background workers cannot use the “Free” instan
 
 `runtime.txt` pins the Python version for Render’s Python runtime.
 
-### Why `VERIFIED_USERS_PATH` matters
+### Session timeout behavior
 
-Ephemeral disks wipe files on redeploy. Use a **mounted disk** path (as in `render.yaml`) or members will need to enter the passcode again after each deploy.
+Unlock is intentionally temporary. After `SESSION_TTL_MINUTES` of inactivity, members must enter passcode again.
 
 ---
 
@@ -213,7 +213,7 @@ Ephemeral disks wipe files on redeploy. Use a **mounted disk** path (as in `rend
 ## Limitations
 
 - **Shared passcode**: anyone with the code can unlock; rotate it if it leaks.
-- **Single-server file**: `verified_users.json` is local to the host unless you redesign storage.
+- **Session timeout**: users need to re-enter passcode after inactivity by design.
 
 ---
 

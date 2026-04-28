@@ -25,6 +25,16 @@ def _parse_admin_ids(raw: str | None) -> set[int]:
     return out
 
 
+def _parse_positive_int(raw: str | None, default: int) -> int:
+    if not raw:
+        return default
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return default
+    return n if n > 0 else default
+
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_PASSCODE = os.environ.get("BOT_PASSCODE", "").strip()
 ADMIN_TELEGRAM_IDS = _parse_admin_ids(os.environ.get("ADMIN_TELEGRAM_IDS"))
@@ -49,6 +59,7 @@ if _raw_sa_json:
 
 # Comma-separated CCA names → tap-to-pick instead of typing (optional).
 CCA_OPTIONS = _parse_cca_options(os.environ.get("CCA_OPTIONS"))
+SESSION_TTL_MINUTES = _parse_positive_int(os.environ.get("SESSION_TTL_MINUTES"), 30)
 
 _verified_override = os.environ.get("VERIFIED_USERS_PATH", "").strip()
 VERIFIED_USERS_PATH = (
@@ -72,6 +83,8 @@ def validate_config() -> list[str]:
         errors.append("ADMIN_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
     if not GOOGLE_SHEET_ID:
         errors.append("GOOGLE_SHEET_ID is missing")
+    if SESSION_TTL_MINUTES < 1:
+        errors.append("SESSION_TTL_MINUTES must be >= 1")
     if SERVICE_ACCOUNT_JSON_ERROR:
         errors.append(SERVICE_ACCOUNT_JSON_ERROR)
     elif SERVICE_ACCOUNT_INFO is not None:

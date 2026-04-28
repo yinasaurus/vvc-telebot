@@ -11,14 +11,7 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    # Keeps verified_users.json across deploys (set VERIFIED_USERS_PATH to match).
-    disk:
-      name: bot-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: VERIFIED_USERS_PATH
-        value: /var/data/verified_users.json
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: BOT_PASSCODE

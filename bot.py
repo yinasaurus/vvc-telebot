@@ -26,7 +26,6 @@ from telegram.ext import (
 
 import config
 import sheets
-from verified_store import load_verified_users, save_verified_users
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -173,6 +172,7 @@ _MAX_PASS_FAILS = 5
 _LOCKOUT_SEC = 15 * 60
 _pass_failures: dict[int, int] = {}
 _pass_lock_until: dict[int, float] = {}
+_SESSION_TTL_SEC = max(60, config.SESSION_TTL_MINUTES * 60)
 
 
 def parse_three_csv_fields(text: str) -> tuple[str, str, str] | None:
@@ -191,7 +191,20 @@ def _is_admin(user_id: int) -> bool:
 
 
 def _verified(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    return user_id in context.application.bot_data["verified_users"]
+    sessions: dict[int, float] = context.application.bot_data["unlocked_until"]
+    now_m = time.monotonic()
+    exp = sessions.get(user_id)
+    if exp is None or now_m >= exp:
+        sessions.pop(user_id, None)
+        return False
+    # Sliding session: active users stay unlocked while chatting.
+    sessions[user_id] = now_m + _SESSION_TTL_SEC
+    return True
+
+
+def _unlock_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    sessions: dict[int, float] = context.application.bot_data["unlocked_until"]
+    sessions[user_id] = time.monotonic() + _SESSION_TTL_SEC
 
 
 def _main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -235,7 +248,7 @@ def _help_text(*, include_admin: bool) -> str:
         "",
         "Borrower workflow",
         "1) Unlock — First time here: send the shared passcode (only in this private chat). "
-        "Your Telegram account stays unlocked on this server.",
+        f"Session unlock expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity.",
         "",
         "2) New request — Say what you need in exactly one line:",
         "   item, qty, reason",
@@ -318,7 +331,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Only people with the passcode can use it.\n\n"
         "Next step: send the shared passcode as your next message right here "
         "(private chat only — not in groups).\n\n"
-        "After this Telegram account unlocks once on this server, you won't need the passcode again.\n\n"
+        f"Session unlock expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity,\n"
+        "then passcode is required again.\n\n"
         "Send /help anytime for a full how-to (even before unlocking)."
     )
     try:
@@ -379,24 +393,13 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _pass_failures.pop(uid, None)
     _pass_lock_until.pop(uid, None)
 
-    users: set[int] = context.application.bot_data["verified_users"]
-    users.add(uid)
-    if not save_verified_users(config.VERIFIED_USERS_PATH, users):
-        users.discard(uid)
-        logger.error("Failed to persist verified_users.json for uid=%s", uid)
-        try:
-            await update.message.reply_text(
-                "Unlock could not be saved on the server (disk or permissions). "
-                "Ask the bot maintainer to check verified_users.json."
-            )
-        except TelegramError:
-            logger.exception("try_passcode: save-error reply failed")
-        return
+    _unlock_session(context, uid)
     try:
         await update.message.reply_text(
             "Unlocked.\n\n"
             "Use the bottom buttons: New request, My loans, Return an item. "
             "Admins also see Admin: pending loans / pending returns.\n\n"
+            f"Session expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity.\n"
             "Send /help for how the whole flow works (sheet logging, Sign / acknowledge, returns).",
             reply_markup=_main_keyboard(uid),
         )
@@ -952,14 +955,12 @@ def main() -> None:
     except RuntimeError as e:
         raise SystemExit(str(e)) from e
 
-    verified = load_verified_users(config.VERIFIED_USERS_PATH)
-
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .build()
     )
-    app.bot_data["verified_users"] = verified
+    app.bot_data["unlocked_until"] = {}
 
     app.add_error_handler(error_handler)
 
