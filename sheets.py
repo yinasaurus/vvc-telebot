@@ -240,6 +240,33 @@ def _parse_qty_number(raw: str) -> float:
         return 0.0
 
 
+def _singularize_word(word: str) -> str:
+    """Simple singularization for inventory-style nouns."""
+    w = word.strip().casefold()
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith(("ses", "xes", "zes", "ches", "shes")) and len(w) > 4:
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _normalize_item_key(raw: str) -> str:
+    """
+    Normalize item name for collation:
+    - case-insensitive
+    - whitespace-normalized
+    - basic plural-to-singular conversion per word
+    """
+    parts = [p for p in re.split(r"\s+", (raw or "").strip()) if p]
+    if not parts:
+        return ""
+    return " ".join(_singularize_word(p) for p in parts)
+
+
 def refresh_collated_logs(credentials_path: str, sheet_id: str) -> None:
     txs = list_transactions(credentials_path, sheet_id)
     agg: dict[str, dict[str, float | int | str]] = {}
@@ -247,7 +274,7 @@ def refresh_collated_logs(credentials_path: str, sheet_id: str) -> None:
         item = (t.get("need_item") or "").strip()
         if not item:
             continue
-        key = item.casefold()
+        key = _normalize_item_key(item)
         rec = agg.setdefault(
             key,
             {"item": item, "total_qty": 0.0, "request_count": 0},
