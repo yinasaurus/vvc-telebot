@@ -32,6 +32,10 @@ def _parse_positive_int(raw: str | None, default: int) -> int:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_PASSCODE = os.environ.get("BOT_PASSCODE", "").strip()
 ADMIN_TELEGRAM_IDS = _parse_admin_ids(os.environ.get("ADMIN_TELEGRAM_IDS"))
+ALERT_TELEGRAM_IDS = _parse_admin_ids(
+    os.environ.get("ALERT_TELEGRAM_IDS") or os.environ.get("ADMIN_TELEGRAM_IDS")
+)
+ALERT_COOLDOWN_SEC = _parse_positive_int(os.environ.get("ALERT_COOLDOWN_SEC"), 300)
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
     "GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json"
@@ -66,6 +70,8 @@ def validate_config() -> list[str]:
         )
     if not ADMIN_TELEGRAM_IDS:
         errors.append("ADMIN_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
+    if not ALERT_TELEGRAM_IDS:
+        errors.append("ALERT_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
     if not GOOGLE_SHEET_ID:
         errors.append("GOOGLE_SHEET_ID is missing")
     if SESSION_TTL_MINUTES < 1:

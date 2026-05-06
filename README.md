@@ -13,7 +13,7 @@ Use this in **private chat** with the bot (not groups).
 3. A new row appears in the sheet with status **pending_admin**.
 4. **Admin** (logistics) opens **Admin: pending loans**, picks the request, and sends **what was actually loaned** in the same structured format.
 5. The sheet updates; status becomes **awaiting_user_ack**, with timestamps and admin Telegram identity recorded.
-6. **Borrower** opens **My loans** and taps **Sign / acknowledge** — that records their confirmation (“signature”) on the sheet.
+6. **Borrower** opens **My loans** and taps **Sign / acknowledge**, enters full name, then types `CONFIRM`.
 7. Status becomes **on_loan**; borrower’s acknowledgement time is recorded.
 8. When returning: **Borrower** uses **Return an item** → status **pending_return**.
 9. **Admin** uses **Admin: pending returns** → approves → status **returned**, with approver and time recorded.
@@ -78,7 +78,7 @@ The bot stores **three columns each** for need and loan: `need_item`, `need_qty`
 | Step | Who | Where in the bot | What happens on the sheet |
 |------|-----|------------------|---------------------------|
 | Approve the loan (logistics) | Admin | **Admin: pending loans** → pick row → send `item, qty, reason` | Fills loan columns + `loan_recorded_at`, status → `awaiting_user_ack` |
-| Sign / acknowledge receipt | Borrower | **My loans** → **Sign / acknowledge** | Sets `user_ack_at`, status → `on_loan` |
+| Sign / acknowledge receipt | Borrower | **My loans** → **Sign / acknowledge** → full name + `CONFIRM` | Sets `user_ack_at`, `ack_full_name`, `ack_method`, status → `on_loan` |
 | Approve return | Admin | **Admin: pending returns** → button | Sets `return_approved_*`, status → `returned` |
 
 Use **`/admin`** in Telegram for a short reminder (admins only).
@@ -99,12 +99,15 @@ Row 1 must match the bot headers (created automatically on an empty sheet). **Ol
 | `status` | One of the status values above |
 | `loan_item`, `loan_qty`, `loan_reason` | What logistics recorded as loaned |
 | `admin_*` / `loan_recorded_at` | Who recorded the loan and when |
-| `user_ack_at` | When the borrower signed / acknowledged |
+| `user_ack_at`, `ack_full_name`, `ack_method` | Borrower signature data |
 | `return_requested_at` | When return was started |
 | `return_approved_at` | When logistics approved return |
 | `return_approver_*` | Who approved the return |
 
 The bot also maintains a second worksheet named **`collated_logs`** that aggregates total requested quantities by item across all requests.
+You can optionally maintain:
+- **`limits`** (`item`, `max_outstanding_qty`) to enforce per-CCA outstanding caps (active statuses only: pending_admin, awaiting_user_ack, on_loan, pending_return).
+- **`item_aliases`** (`alias`, `canonical_item`) to merge naming variants (e.g. `tables` -> `table`) for caps/collation.
 
 ---
 

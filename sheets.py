@@ -14,8 +14,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# 22 columns A–V, keep in sync with len(HEADERS)
-_END_COL = "V"
+# 24 columns A–X, keep in sync with len(HEADERS)
+_END_COL = "X"
 
 HEADERS = [
     "id",
@@ -36,6 +36,8 @@ HEADERS = [
     "admin_username",
     "loan_recorded_at",
     "user_ack_at",
+    "ack_full_name",
+    "ack_method",
     "return_requested_at",
     "return_approved_at",
     "return_approver_tg_id",
@@ -64,6 +66,32 @@ LEGACY_HEADERS_V1 = [
     "return_approver_username",
 ]
 
+# Previous 22-column schema before ack_full_name/ack_method.
+LEGACY_HEADERS_V2 = [
+    "id",
+    "created_at",
+    "updated_at",
+    "requester_tg_id",
+    "requester_username",
+    "requester_display_name",
+    "cca",
+    "need_item",
+    "need_qty",
+    "need_reason",
+    "status",
+    "loan_item",
+    "loan_qty",
+    "loan_reason",
+    "admin_tg_id",
+    "admin_username",
+    "loan_recorded_at",
+    "user_ack_at",
+    "return_requested_at",
+    "return_approved_at",
+    "return_approver_tg_id",
+    "return_approver_username",
+]
+
 STATUS_PENDING_ADMIN = "pending_admin"
 STATUS_AWAITING_ACK = "awaiting_user_ack"
 STATUS_ON_LOAN = "on_loan"
@@ -72,6 +100,10 @@ STATUS_RETURNED = "returned"
 STATUS_CANCELLED = "cancelled"
 COLLATED_SHEET_NAME = "collated_logs"
 COLLATED_HEADERS = ["item", "total_qty", "request_count", "updated_at"]
+LIMITS_SHEET_NAME = "limits"
+LIMITS_HEADERS = ["item", "max_outstanding_qty"]
+ALIASES_SHEET_NAME = "item_aliases"
+ALIASES_HEADERS = ["alias", "canonical_item"]
 ADMIN_AUDIT_SHEET_NAME = "admin_audit"
 ADMIN_AUDIT_HEADERS = [
     "timestamp",
@@ -126,10 +158,45 @@ def _migrate_legacy_data_row(row: list[str]) -> list[str]:
         r[11],
         r[12],
         r[13],
+        "",
+        "",
         r[14],
         r[15],
         r[16],
         r[17],
+    ]
+
+
+def _migrate_legacy_v2_row(row: list[str]) -> list[str]:
+    r = list(row)
+    while len(r) < 22:
+        r.append("")
+    r = r[:22]
+    return [
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15],
+        r[16],
+        r[17],
+        "",
+        "",
+        r[18],
+        r[19],
+        r[20],
+        r[21],
     ]
 
 
@@ -139,6 +206,21 @@ def _migrate_legacy_sheet(ws: gspread.Worksheet, all_vals: list[list[str]]) -> N
         if not row or not row[0]:
             continue
         new_rows.append(_migrate_legacy_data_row(row))
+    ws.clear()
+    if new_rows:
+        ws.update(
+            f"A1:{_END_COL}{len(new_rows)}",
+            new_rows,
+            value_input_option="USER_ENTERED",
+        )
+
+
+def _migrate_legacy_v2_sheet(ws: gspread.Worksheet, all_vals: list[list[str]]) -> None:
+    new_rows: list[list[str]] = [HEADERS]
+    for row in all_vals[1:]:
+        if not row or not row[0]:
+            continue
+        new_rows.append(_migrate_legacy_v2_row(row))
     ws.clear()
     if new_rows:
         ws.update(
@@ -176,12 +258,15 @@ def ensure_headers(credentials_path: str, sheet_id: str) -> None:
     if row1 == LEGACY_HEADERS_V1:
         _migrate_legacy_sheet(ws, all_vals)
         return
+    if row1 == LEGACY_HEADERS_V2:
+        _migrate_legacy_v2_sheet(ws, all_vals)
+        return
     if len(all_vals) == 1 and not any(row1):
         ws.update(f"A1:{_END_COL}1", [HEADERS], value_input_option="USER_ENTERED")
         return
     raise RuntimeError(
         "Row 1 of the Google Sheet must be the bot header row. "
-        "Expected current columns or the legacy 18-column layout (auto-migrated). "
+        "Expected current columns or legacy 18/22-column layouts (auto-migrated). "
         "Use a fresh sheet or fix row 1."
     )
 
@@ -221,6 +306,8 @@ def append_request(
         "",  # admin_username
         "",  # loan_recorded_at
         "",  # user_ack_at
+        "",  # ack_full_name
+        "",  # ack_method
         "",  # return_requested_at
         "",  # return_approved_at
         "",  # return_approver_tg_id
@@ -230,7 +317,7 @@ def append_request(
     refresh_collated_logs(credentials_path, sheet_id)
 
 
-def _parse_qty_number(raw: str) -> float:
+def parse_qty_number(raw: str) -> float:
     m = re.search(r"[-+]?\d*\.?\d+", raw or "")
     if not m:
         return 0.0
@@ -254,7 +341,7 @@ def _singularize_word(word: str) -> str:
     return w
 
 
-def _normalize_item_key(raw: str) -> str:
+def normalize_item_key(raw: str) -> str:
     """
     Normalize item name for collation:
     - case-insensitive
@@ -267,20 +354,58 @@ def _normalize_item_key(raw: str) -> str:
     return " ".join(_singularize_word(p) for p in parts)
 
 
+def get_item_aliases(credentials_path: str, sheet_id: str) -> dict[str, str]:
+    """
+    Return alias->canonical map using normalized keys.
+    Worksheet: item_aliases
+    Columns: alias | canonical_item
+    """
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(ALIASES_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=ALIASES_SHEET_NAME, rows=200, cols=4)
+        ws.update("A1:B1", [ALIASES_HEADERS], value_input_option="USER_ENTERED")
+        return {}
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return {}
+    out: dict[str, str] = {}
+    for r in rows[1:]:
+        if not r:
+            continue
+        alias = normalize_item_key(r[0] if len(r) >= 1 else "")
+        canonical = normalize_item_key(r[1] if len(r) >= 2 else "")
+        if alias and canonical:
+            out[alias] = canonical
+    return out
+
+
+def canonical_item_key(raw: str, aliases: dict[str, str] | None = None) -> str:
+    base = normalize_item_key(raw)
+    if not base:
+        return ""
+    if aliases and base in aliases:
+        return aliases[base]
+    return base
+
+
 def refresh_collated_logs(credentials_path: str, sheet_id: str) -> None:
     txs = list_transactions(credentials_path, sheet_id)
+    aliases = get_item_aliases(credentials_path, sheet_id)
     agg: dict[str, dict[str, float | int | str]] = {}
     for t in txs:
         item = (t.get("need_item") or "").strip()
         if not item:
             continue
-        key = _normalize_item_key(item)
+        key = canonical_item_key(item, aliases)
         rec = agg.setdefault(
             key,
             {"item": item, "total_qty": 0.0, "request_count": 0},
         )
         rec["request_count"] = int(rec["request_count"]) + 1
-        rec["total_qty"] = float(rec["total_qty"]) + _parse_qty_number(t.get("need_qty", ""))
+        rec["total_qty"] = float(rec["total_qty"]) + parse_qty_number(t.get("need_qty", ""))
 
     rows: list[list[str]] = [COLLATED_HEADERS]
     now = now_iso()
@@ -302,6 +427,37 @@ def refresh_collated_logs(credentials_path: str, sheet_id: str) -> None:
     ws.clear()
     end_row = max(1, len(rows))
     ws.update(f"A1:D{end_row}", rows, value_input_option="USER_ENTERED")
+
+
+def get_item_limits(credentials_path: str, sheet_id: str) -> dict[str, float]:
+    aliases = get_item_aliases(credentials_path, sheet_id)
+    """
+    Return configurable per-item max outstanding quantity.
+    Worksheet: limits
+    Columns: item | max_outstanding_qty
+    """
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(LIMITS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LIMITS_SHEET_NAME, rows=200, cols=4)
+        ws.update("A1:B1", [LIMITS_HEADERS], value_input_option="USER_ENTERED")
+        return {}
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return {}
+    out: dict[str, float] = {}
+    for r in rows[1:]:
+        if not r:
+            continue
+        item = (r[0] if len(r) >= 1 else "").strip()
+        limit_raw = (r[1] if len(r) >= 2 else "").strip()
+        key = canonical_item_key(item, aliases)
+        limit = parse_qty_number(limit_raw)
+        if key and limit > 0:
+            out[key] = limit
+    return out
 
 
 def append_admin_audit(
