@@ -21,25 +21,55 @@ Use this in **private chat** with the bot (not groups).
 If a message does not match the required **three-part comma format**, the bot rejects it and shows the template again.
 
 ```mermaid
-flowchart LR
-  subgraph borrower
-    A[Unlock passcode]
-    B[New request]
-    C[Acknowledge loan]
-    D[Request return]
-  end
-  subgraph sheet[Google Sheet]
-    S[(Row + status)]
-  end
-  subgraph admin
-    E[Record loan details]
-    F[Approve return]
-  end
-  A --> B --> S
-  E --> S
-  C --> S
-  D --> S
-  F --> S
+flowchart TD
+    A[User opens bot /start] --> B{Session unlocked?}
+    B -- No --> C[Enter passcode]
+    C --> D{Passcode correct?}
+    D -- No --> E[Reject + lockout after too many tries]
+    D -- Yes --> F[Show main menu]
+    B -- Yes --> F
+
+    F --> G[New request]
+    F --> H[My loans]
+    F --> I[Return an item]
+    F --> J[Edit a request]
+    F --> K[Admin: pending loans]
+    F --> L[Admin: pending returns]
+
+    G --> G1[Pick Group]
+    G1 --> G2[Pick Club]
+    G2 --> G3[Submit item, qty, reason<br/>single or batch]
+    G3 --> G4{Valid format + limits check?}
+    G4 -- No --> G5[Reject with error]
+    G4 -- Yes --> G6[Create transaction rows<br/>status=pending_admin]
+    G6 --> G7[Refresh collated_logs]
+
+    K --> K1[Admin picks pending request]
+    K1 --> K2[Admin enters loan item, qty, reason]
+    K2 --> K3[Update loan fields + admin identity + timestamp]
+    K3 --> K4[status=awaiting_user_ack]
+    K4 --> K5[Write admin_audit]
+
+    H --> H1[Optional CCA filter]
+    H1 --> H2[Show user's active loans]
+    H2 --> H3[Tap Sign / acknowledge]
+    H3 --> H4[Enter full name]
+    H4 --> H5[Type CONFIRM]
+    H5 --> H6[Update user_ack_at + ack_full_name + ack_method]
+    H6 --> H7[status=on_loan]
+
+    I --> I1[User selects on_loan item]
+    I1 --> I2[status=pending_return]
+    L --> L1[Admin approves return]
+    L1 --> L2[Update return approver + timestamp]
+    L2 --> L3[status=returned]
+    L3 --> L4[Write admin_audit]
+
+    J --> J1[User picks editable request]
+    J1 --> J2{Status editable?<br/>pending_admin or awaiting_user_ack}
+    J2 -- No --> J3[Reject: return flow first]
+    J2 -- Yes --> J4[Set status=cancelled]
+    J4 --> G1
 ```
 
 ---
