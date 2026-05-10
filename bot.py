@@ -644,15 +644,15 @@ def _clear_ui_flow_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _abort_user_flow(
     update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int
 ) -> None:
-    """Clear in-progress flows and always restore the main menu keyboard.
+    """Clear in-progress flows and hide the reply keyboard.
 
-    Duplicate Exit/Cancel updates in a short burst only send the word "Cancelled." once,
-    but still re-apply the main keyboard (so you are not stuck on Group/Club picker keys).
+    Duplicate Exit/Cancel taps in one burst send only one visible "Cancelled." line,
+    but both hide the keyboard. Send /start or /help to show the menu again.
     """
     _clear_ui_flow_user_data(context)
     if not update.message:
         return
-    kb = _main_keyboard(uid)
+    remove = ReplyKeyboardRemove()
     now_m = time.monotonic()
     deb: dict[int, float] = context.application.bot_data.setdefault(
         "cancel_reply_last_ts", {}
@@ -661,9 +661,13 @@ async def _abort_user_flow(
     say_cancelled = (
         last_verbal is None or now_m - last_verbal >= _REPLY_KEYBOARD_DUPLICATE_BURST_SEC
     )
-    msg = "Cancelled." if say_cancelled else "\u200c"
+    msg = (
+        "Cancelled. Send /start or /help to show the menu again."
+        if say_cancelled
+        else "\u200c"
+    )
     try:
-        await update.message.reply_text(msg, reply_markup=kb)
+        await update.message.reply_text(msg, reply_markup=remove)
     except TelegramError:
         logger.exception("abort_user_flow: reply failed")
         return
@@ -687,7 +691,7 @@ def _help_text(*, include_admin: bool) -> str:
         "when both sides confirmed, and when gear came back.",
         "",
         "Buttons (bottom of chat)",
-        "Help — this guide · Exit / Cancel — leave a step without losing unlock",
+        "Help — this guide · Exit / Cancel — stop a step and hide the keyboard (/start or /help brings it back)",
         "",
         "Commands (optional)",
         "/start — Refresh intro and keyboard",
