@@ -808,10 +808,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     uid = update.effective_user.id
-    context.user_data.pop("flow", None)
-    context.user_data.pop("pending_group", None)
-    context.user_data.pop("pending_cca", None)
-    context.user_data.pop("expect_loan_for", None)
+    _clear_ui_flow_user_data(context)
     if _verified(context, uid):
         await update.message.reply_text(
             "State reset. Use the menu below.",
