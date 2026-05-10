@@ -8,14 +8,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _normalize_admin_ids_env(raw: str) -> str:
+    """Strip BOM, trim, drop trailing # comments (single-line .env style)."""
+    s = raw.replace("\ufeff", "").strip()
+    if "#" in s:
+        s = s.split("#", 1)[0].strip()
+    return s
+
+
 def _parse_admin_ids(raw: str | None) -> set[int]:
     if not raw:
         return set()
     out: set[int] = set()
     for part in raw.split(","):
-        part = part.strip()
+        part = part.strip().strip('"').strip("'")  # allow quoted tokens in env
+        if not part:
+            continue
         if part.isdigit():
             out.add(int(part))
+            continue
+        if part.startswith("+") and part[1:].isdigit():
+            out.add(int(part[1:]))
     return out
 
 
@@ -31,7 +44,8 @@ def _parse_positive_int(raw: str | None, default: int) -> int:
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_PASSCODE = os.environ.get("BOT_PASSCODE", "").strip()
-ADMIN_TELEGRAM_IDS = _parse_admin_ids(os.environ.get("ADMIN_TELEGRAM_IDS"))
+ADMIN_TELEGRAM_IDS_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "").strip()
+ADMIN_TELEGRAM_IDS = _parse_admin_ids(_normalize_admin_ids_env(ADMIN_TELEGRAM_IDS_RAW))
 ALERT_TELEGRAM_IDS = _parse_admin_ids(
     os.environ.get("ALERT_TELEGRAM_IDS") or os.environ.get("ADMIN_TELEGRAM_IDS")
 )
@@ -69,7 +83,16 @@ def validate_config() -> list[str]:
             "BOT_PASSCODE should be at least 12 characters (use a random phrase or password manager)"
         )
     if not ADMIN_TELEGRAM_IDS:
-        errors.append("ADMIN_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
+        if _normalize_admin_ids_env(ADMIN_TELEGRAM_IDS_RAW):
+            errors.append(
+                "ADMIN_TELEGRAM_IDS is set but parsed to zero valid IDs. "
+                "Use numeric IDs only — open the bot and send /whoami, "
+                'then paste that number here (comma-separated). Do not use @username.'
+            )
+        else:
+            errors.append(
+                "ADMIN_TELEGRAM_IDS is missing (comma-separated numeric Telegram user IDs)"
+            )
     if not ALERT_TELEGRAM_IDS:
         errors.append("ALERT_TELEGRAM_IDS is missing (comma-separated Telegram user IDs)")
     if not GOOGLE_SHEET_ID:

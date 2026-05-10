@@ -1,6 +1,6 @@
 # VVC Telegram loan bot
 
-A Telegram bot that records **equipment loan requests**, **two-sided confirmations** (logistics records what went out; borrower acknowledges), and **returns** with admin approval. Everything is stored in **Google Sheets** as an audit log—no LLM, rule-based messages only.
+A Telegram bot that records **equipment loan requests**, **logistics approve/reject** with **Telegram notifications**, **borrower acknowledgement** after approval, and **returns** with admin approval. Everything is stored in **Google Sheets** as an audit log—no LLM, rule-based messages only.
 
 Use this in **private chat** with the bot (not groups).
 
@@ -11,12 +11,12 @@ Use this in **private chat** with the bot (not groups).
 1. **Borrower** unlocks the bot with a shared passcode (session-based).
 2. **Borrower** creates a **New request**: pick **Group** and **Club** from buttons, then send **item, qty, reason** (see format below).
 3. A new row appears in the sheet with status **pending_admin**.
-4. **Admin** (logistics) opens **Admin: pending loans**, picks the request, and sends **what was actually loaned** in the same structured format.
+4. **Admin** (logistics) opens **Pending loans** on the keyboard and taps **Approve** or **Reject** (or uses `/recordloan` / `/rejectloan`). Borrowers get a **Telegram DM** either way. Approve copies the request onto the loan columns and moves the row to awaiting signature.
 5. The sheet updates; status becomes **awaiting_user_ack**, with timestamps and admin Telegram identity recorded.
 6. **Borrower** opens **My loans** and taps **Sign / acknowledge**, enters full name, then types `CONFIRM`.
 7. Status becomes **on_loan**; borrower’s acknowledgement time is recorded.
-8. When returning: **Borrower** uses **Return an item** → status **pending_return**.
-9. **Admin** uses **Admin: pending returns** → approves → status **returned**, with approver and time recorded.
+8. When returning: **Borrower** sends **`/return <transaction_id>`** (id from the Sheet log or My loans) → status **pending_return**.
+9. **Admin** uses **Pending returns** → approves → status **returned**, with approver and time recorded.
 
 If a message does not match the required **three-part comma format**, the bot rejects it and shows the template again.
 
@@ -25,16 +25,16 @@ flowchart TD
     A[User opens bot /start] --> B{Session unlocked?}
     B -- No --> C[Enter passcode]
     C --> D{Passcode correct?}
-    D -- No --> E[Reject + lockout after too many tries]
+    D -- No --> E[Reject wrong passcode]
     D -- Yes --> F[Show main menu]
     B -- Yes --> F
 
     F --> G[New request]
     F --> H[My loans]
-    F --> I[Return an item]
+    F --> IR[Send /return + Sheet id]
     F --> J[Edit a request]
-    F --> K[Admin: pending loans]
-    F --> L[Admin: pending returns]
+    F --> K[Pending loans]
+    F --> L[Pending returns]
 
     G --> G1[Pick Group]
     G1 --> G2[Pick Club]
@@ -45,8 +45,8 @@ flowchart TD
     G6 --> G7[Refresh collated_logs]
 
     K --> K1[Admin picks pending request]
-    K1 --> K2[Admin enters loan item, qty, reason]
-    K2 --> K3[Update loan fields + admin identity + timestamp]
+    K1 --> K2[Admin Approve or Reject<br/>borrower notified via Telegram]
+    K2 --> K3[Approve: copy need→loan + admin + timestamp]
     K3 --> K4[status=awaiting_user_ack]
     K4 --> K5[Write admin_audit]
 
@@ -58,8 +58,7 @@ flowchart TD
     H5 --> H6[Update user_ack_at + ack_full_name + ack_method]
     H6 --> H7[status=on_loan]
 
-    I --> I1[User selects on_loan item]
-    I1 --> I2[status=pending_return]
+    IR --> IR1[status=pending_return]
     L --> L1[Admin approves return]
     L1 --> L2[Update return approver + timestamp]
     L2 --> L3[status=returned]
@@ -67,7 +66,7 @@ flowchart TD
 
     J --> J1[User picks editable request]
     J1 --> J2{Status editable?<br/>pending_admin or awaiting_user_ack}
-    J2 -- No --> J3[Reject: return flow first]
+    J2 -- No --> J3[Reject · if on loan use /return]
     J2 -- Yes --> J4[Set status=cancelled]
     J4 --> G1
 ```
@@ -78,8 +77,8 @@ flowchart TD
 
 | Status | Meaning |
 |--------|---------|
-| `pending_admin` | Request logged; logistics has not recorded what was loaned yet. |
-| `awaiting_user_ack` | Logistics entered loan details; borrower must acknowledge under **My loans**. |
+| `pending_admin` | Request logged; logistics has not approved or rejected yet. |
+| `awaiting_user_ack` | Logistics approved (loan line matches request); borrower must acknowledge under **My loans**. |
 | `on_loan` | Borrower acknowledged; item is considered out on loan. |
 | `pending_return` | Borrower started return; logistics has not confirmed yet. |
 | `returned` | Logistics approved return; transaction closed on the sheet. |
@@ -88,7 +87,7 @@ flowchart TD
 
 ## Message format: `item, qty, reason`
 
-Both **borrower need** and **admin loan line** must be **one message** with **three parts**, separated by the **first two commas**:
+**Borrowers** submit **need** lines as **one message** per item with **three parts**, separated by the **first two commas**:
 
 - **Item** — what (trimmed).
 - **Qty** — how many / how much (trimmed; can be text like `2` or `1 set`).
@@ -99,7 +98,7 @@ Examples:
 - `HDMI cable, 2, Year-end concert booth`
 - `Mic set A, 1, Signed from store — backup for assembly` (comma inside the reason is OK)
 
-The bot stores **three columns each** for need and loan: `need_item`, `need_qty`, `need_reason`, and `loan_item`, `loan_qty`, `loan_reason`.
+The bot stores **three columns each** for need and loan: `need_item`, `need_qty`, `need_reason`, and `loan_item`, `loan_qty`, `loan_reason`. On **Approve**, logistics copies **need→loan** (same wording) unless you edit the sheet manually later.
 
 ---
 
@@ -107,9 +106,11 @@ The bot stores **three columns each** for need and loan: `need_item`, `need_qty`
 
 | Step | Who | Where in the bot | What happens on the sheet |
 |------|-----|------------------|---------------------------|
-| Approve the loan (logistics) | Admin | **Admin: pending loans** → pick row → send `item, qty, reason` | Fills loan columns + `loan_recorded_at`, status → `awaiting_user_ack` |
+| Approve the loan (logistics) | Admin | **Pending loans** → **Approve**, or `/recordloan <tx_id>` | Copies need→loan columns + admin + timestamp; statuses → `awaiting_user_ack`; **DMs borrower** |
+| Decline request | Admin | **Reject**, or `/rejectloan <tx_id>` | Status → `cancelled`; **DMs borrower** |
 | Sign / acknowledge receipt | Borrower | **My loans** → **Sign / acknowledge** → full name + `CONFIRM` | Sets `user_ack_at`, `ack_full_name`, `ack_method`, status → `on_loan` |
-| Approve return | Admin | **Admin: pending returns** → button | Sets `return_approved_*`, status → `returned` |
+| Start return | Borrower | **`/return <tx_id>`** — paste id from Sheet log or **My loans** | Sets `return_requested_at`, status → `pending_return` |
+| Approve return | Admin | **Pending returns** → button | Sets `return_approved_*`, status → `returned` |
 
 Use **`/admin`** in Telegram for a short reminder (admins only).
 
@@ -134,6 +135,8 @@ Row 1 must match the bot headers (created automatically on an empty sheet). **Ol
 | `return_approved_at` | When logistics approved return |
 | `return_approver_*` | Who approved the return |
 
+After a successful connection, the bot may create **`bot_quickref`** once: a plain-English recap of statuses, **`id`** usage (**`/return`**, **`/status`**, admin commands), and sign-off before returning. Existing tabs are left alone unless a tab’s header row is empty or malformed (then row 1 is repaired to match the bot).
+
 The bot also maintains a second worksheet named **`collated_logs`** that aggregates total requested quantities by item across all requests.
 You can optionally maintain:
 - **`limits`** (`item`, `max_outstanding_qty`) to enforce per-CCA outstanding caps (active statuses only: pending_admin, awaiting_user_ack, on_loan, pending_return).
@@ -146,12 +149,12 @@ You can optionally maintain:
 | Role | How it’s determined | Capabilities |
 |------|---------------------|--------------|
 | **Anyone** | Opens the bot on Telegram | Nothing useful until unlocked. |
-| **Member** | Correct **BOT_PASSCODE** once | Menu: New request, My loans, Return an item. |
-| **Admin** | Telegram user id in **ADMIN_TELEGRAM_IDS** | Same as member **plus** Admin: pending loans / pending returns. |
+| **Member** | Correct **BOT_PASSCODE** once | Menu: New request, My loans, Edit a request · returns via **`/return <tx_id>`**. |
+| **Admin** | Telegram user id in **ADMIN_TELEGRAM_IDS** | Same as member **plus** Pending loans / Pending returns queues. |
 
 **Passcode notes:**
 
-- Wrong guesses are counted; after **5** failures, that Telegram account waits **15 minutes** before trying again (in-memory; resets if the bot process restarts).
+- Wrong passcode simply gets a retry message (no lockout table in the bot).
 - Unlock is session-based: after inactivity (`SESSION_TTL_MINUTES`), users must enter passcode again.
 
 ---
@@ -235,11 +238,16 @@ Unlock is intentionally temporary. After `SESSION_TTL_MINUTES` of inactivity, me
 | `/help` | Full step-by-step guide (borrowers + admin section if you’re an admin) |
 | `/whoami` | Show your Telegram ID, role (admin/member), and session status |
 | `/status <tx_id>` | Show status/details of one transaction (admin: any, member: own only) |
+| `/find` | **Admins only** — search Sheet rows in chat: `/find tg <id>`, `/find club <text>`, etc. Borrowers use **My loans** for their items. |
 | `/cancelreq <tx_id>` | Cancel mistaken request before/while approval (not after on-loan/returned) |
 | `/editreq <tx_id>` | User-only edit flow: cancel own `pending_admin` request and immediately re-submit |
+| `/return <tx_id>` | Borrower: start return with Sheet **`id`** (or unique hex prefix); must own the row and be **`on_loan`** |
 | `/admin` | Short logistics reminder (admins only) |
 | `/adminlog` | Show latest admin audit entries (admins only) |
 | `/pending` | Queue summary counts (admins only) |
+| `/recordloan <tx_id>` | Approve one pending loan by Sheet **id** or unique hex prefix (admins only) |
+| `/rejectloan <tx_id>` | Reject one pending loan the same way (admins only) |
+| `/backupnow` | Create a timestamped backup worksheet snapshot (admins only) |
 
 ---
 

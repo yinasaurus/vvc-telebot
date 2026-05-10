@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -114,6 +115,9 @@ ADMIN_AUDIT_HEADERS = [
     "admin_display_name",
     "notes",
 ]
+
+# Explains current workflow / commands; created once if missing (not overwritten later).
+QUICKREF_SHEET_NAME = "bot_quickref"
 
 
 def now_iso() -> str:
@@ -246,6 +250,33 @@ def _ws(credentials_path: str, sheet_id: str) -> gspread.Worksheet:
     return sh.sheet1
 
 
+def _strip_pad_row(row: list[str], width: int) -> list[str]:
+    """Trim/pad header or data rows (Sheets API often drops trailing blanks)."""
+    out = [(c or "").strip() for c in row[:width]]
+    while len(out) < width:
+        out.append("")
+    return out[:width]
+
+
+def _sheet_end_col(col_count: int) -> str:
+    """1 → A … 26 → Z … (enough for our small header widths)."""
+    if col_count <= 0:
+        return "A"
+    n = col_count
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _sync_main_header_row(ws: gspread.Worksheet, row1: list[str]) -> None:
+    """Write canonical HEADERS when row 1 is short, mistyped spaces, or API-trimmed."""
+    w = len(HEADERS)
+    if len(row1) < w or any((row1[i] if i < len(row1) else "") != HEADERS[i] for i in range(w)):
+        ws.update(f"A1:{_END_COL}1", [HEADERS], value_input_option="USER_ENTERED")
+
+
 def ensure_headers(credentials_path: str, sheet_id: str) -> None:
     ws = _ws(credentials_path, sheet_id)
     all_vals = ws.get_all_values()
@@ -253,22 +284,85 @@ def ensure_headers(credentials_path: str, sheet_id: str) -> None:
         ws.update(f"A1:{_END_COL}1", [HEADERS], value_input_option="USER_ENTERED")
         return
     row1 = all_vals[0]
-    if row1 == HEADERS:
+    w_main = len(HEADERS)
+
+    if _strip_pad_row(row1, w_main) == HEADERS:
+        _sync_main_header_row(ws, row1)
         return
-    if row1 == LEGACY_HEADERS_V1:
+
+    if _strip_pad_row(row1, len(LEGACY_HEADERS_V1)) == LEGACY_HEADERS_V1:
         _migrate_legacy_sheet(ws, all_vals)
         return
-    if row1 == LEGACY_HEADERS_V2:
+
+    if _strip_pad_row(row1, len(LEGACY_HEADERS_V2)) == LEGACY_HEADERS_V2:
         _migrate_legacy_v2_sheet(ws, all_vals)
         return
-    if len(all_vals) == 1 and not any(row1):
+
+    if len(all_vals) == 1 and not any((c or "").strip() for c in row1):
         ws.update(f"A1:{_END_COL}1", [HEADERS], value_input_option="USER_ENTERED")
         return
+
     raise RuntimeError(
         "Row 1 of the Google Sheet must be the bot header row. "
         "Expected current columns or legacy 18/22-column layouts (auto-migrated). "
         "Use a fresh sheet or fix row 1."
     )
+
+
+def ensure_quickref_sheet(credentials_path: str, sheet_id: str) -> None:
+    """One-time human-readable workflow tab (skipped if it already exists)."""
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        sh.worksheet(QUICKREF_SHEET_NAME)
+        return
+    except gspread.WorksheetNotFound:
+        pass
+    body = (
+        "Loan bot ↔ this spreadsheet",
+        "",
+        "Main tab (usually Sheet1): row 1 = machine keys — do not rename or reorder.",
+        "Column id — use in Telegram for /status, /return (after sign-off), and admin /recordloan /rejectloan.",
+        "",
+        "Status values (column status): pending_admin · awaiting_user_ack · on_loan · pending_return · returned · cancelled",
+        "",
+        "Borrower flow: New request → logistics approves → My loans → Sign (name + CONFIRM) → on_loan.",
+        "Return: sender types /return <id> in Telegram (same id column); logistics approves under Pending returns.",
+        "",
+        "Other tabs: collated_logs (totals), limits (optional caps), item_aliases (optional), admin_audit (logistics actions).",
+    )
+    ws = sh.add_worksheet(title=QUICKREF_SHEET_NAME, rows=40, cols=2)
+    col = [[t] for t in body]
+    ws.update(
+        f"A1:A{len(col)}",
+        col,
+        value_input_option="USER_ENTERED",
+    )
+
+
+def _ensure_aux_worksheet_headers(sh: Any, name: str, headers: list[str]) -> None:
+    """If the tab exists but row 1 is empty or wrong, rewrite the header row only."""
+    try:
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        return
+    raw = ws.get_all_values()
+    ec = _sheet_end_col(len(headers))
+    if not raw:
+        ws.update(f"A1:{ec}1", [headers], value_input_option="USER_ENTERED")
+        return
+    if _strip_pad_row(raw[0], len(headers)) != list(headers):
+        ws.update(f"A1:{ec}1", [headers], value_input_option="USER_ENTERED")
+
+
+def ensure_workbook_extras(credentials_path: str, sheet_id: str) -> None:
+    """After the main tab is valid: quickref tab (once) + repair aux tab headers if needed."""
+    ensure_quickref_sheet(credentials_path, sheet_id)
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    _ensure_aux_worksheet_headers(sh, LIMITS_SHEET_NAME, LIMITS_HEADERS)
+    _ensure_aux_worksheet_headers(sh, ALIASES_SHEET_NAME, ALIASES_HEADERS)
+    _ensure_aux_worksheet_headers(sh, ADMIN_AUDIT_SHEET_NAME, ADMIN_AUDIT_HEADERS)
 
 
 def append_request(
@@ -489,6 +583,21 @@ def append_admin_audit(
         notes,
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def backup_main_sheet(credentials_path: str, sheet_id: str) -> str:
+    """
+    Create a timestamped backup worksheet from the main transaction sheet.
+    Returns the new worksheet title.
+    """
+    ensure_headers(credentials_path, sheet_id)
+    gc = _client(credentials_path)
+    sh = gc.open_by_key(sheet_id)
+    source = sh.sheet1
+    stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
+    title = f"backup_{stamp}"
+    source.duplicate(new_sheet_name=title)
+    return title
 
 
 def list_admin_audit(credentials_path: str, sheet_id: str) -> list[dict[str, str]]:

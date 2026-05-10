@@ -158,6 +158,52 @@ CCA_CANCEL_LABEL = "« Cancel"
 CCA_BACK_LABEL = "« Back"
 MY_LOANS_ALL_LABEL = "All my CCAs"
 
+# Bottom reply keyboard — short labels read better on phones.
+LABEL_HELP = "Help"
+LABEL_SEARCH = "Search"
+LABEL_PENDING_LOANS = "Pending loans"
+LABEL_PENDING_RETURNS = "Pending returns"
+_LEGACY_PENDING_LOANS = "Admin: pending loans"
+_LEGACY_PENDING_RETURNS = "Admin: pending returns"
+
+
+def _main_menu_reply_labels() -> frozenset[str]:
+    return frozenset(
+        {
+            "New request",
+            "My loans",
+            "Edit a request",
+            LABEL_HELP,
+            "Exit / Cancel",
+            LABEL_PENDING_LOANS,
+            LABEL_PENDING_RETURNS,
+            _LEGACY_PENDING_LOANS,
+            _LEGACY_PENDING_RETURNS,
+        }
+    )
+
+
+# Reply keyboard labels that abort the current flow (must be checked before parsers / step handlers).
+_CANCEL_TEXTS = frozenset({"Exit / Cancel", CCA_CANCEL_LABEL})
+# Telegram often delivers two consecutive message updates for a single reply-keyboard tap.
+_REPLY_KEYBOARD_DUPLICATE_BURST_SEC = 2.5
+
+
+def _suppress_duplicate_keyboard_menu_tap(
+    context: ContextTypes.DEFAULT_TYPE, uid: int, text: str
+) -> bool:
+    """Return True to skip handling: same menu label from this user arrived twice in one burst."""
+    now_m = time.monotonic()
+    last: dict[tuple[int, str], float] = context.application.bot_data.setdefault(
+        "reply_keyboard_burst_ts", {}
+    )
+    k = (uid, text)
+    t_prev = last.get(k)
+    if t_prev is not None and now_m - t_prev < _REPLY_KEYBOARD_DUPLICATE_BURST_SEC:
+        return True
+    last[k] = now_m
+    return False
+
 
 def _options_keyboard(options: list[str], *, include_back: bool = False) -> ReplyKeyboardMarkup:
     rows: list[list[KeyboardButton]] = []
@@ -193,11 +239,88 @@ def _fmt_loan_row(t: dict[str, str]) -> str:
         return f"Loaned: {i} × {q} — {r}"
     return "Loaned: (pending)"
 
-# Wrong passcode lockout (in-memory; resets on bot restart)
-_MAX_PASS_FAILS = 5
-_LOCKOUT_SEC = 15 * 60
-_pass_failures: dict[int, int] = {}
-_pass_lock_until: dict[int, float] = {}
+
+def _status_chip(status: str) -> str:
+    mapping = {
+        sheets.STATUS_PENDING_ADMIN: "🟡 pending admin",
+        sheets.STATUS_AWAITING_ACK: "🟠 awaiting signature",
+        sheets.STATUS_ON_LOAN: "🟢 on loan",
+        sheets.STATUS_PENDING_RETURN: "🔵 pending return",
+        sheets.STATUS_RETURNED: "✅ returned",
+        sheets.STATUS_CANCELLED: "⚪ cancelled",
+    }
+    return mapping.get(status, status or "unknown")
+
+
+_FIND_MAX_RESULTS = 22
+_FIND_REPLY_SOFT_CHARS = 3600
+
+
+def _find_usage_text() -> str:
+    return (
+        "Admin search — look up rows here instead of scrolling the Sheet.\n\n"
+        "/find tg <telegram_user_id>\n"
+        "/find id <transaction_id_prefix>\n"
+        "/find club <text> — CCA / club line contains this text\n"
+        "/find keyword <text> — item, qty, reasons, borrower name/username, ids\n"
+        "/find status <status> — exact status (e.g. pending_admin, on_loan)\n\n"
+        "Examples: /find club badminton   /find tg 5912345678\n\n"
+        "Shortcut: tap Search on your admin keyboard anytime.\n"
+        "Tip: /status <full_transaction_id> for full detail on one row."
+    )
+
+
+def _truncate_find_field(s: str, max_len: int) -> str:
+    line = " ".join((s or "").split())
+    return line if len(line) <= max_len else line[: max_len - 1] + "…"
+
+
+def _format_find_hit(t: dict[str, str]) -> str:
+    full_id = (t.get("id") or "").strip()
+    sid = full_id[:12] + "…" if len(full_id) > 12 else full_id or "?"
+    cca = _truncate_find_field(t.get("cca") or "", 42)
+    need_bit = ", ".join(
+        p
+        for p in (
+            (t.get("need_item") or "").strip(),
+            (t.get("need_qty") or "").strip(),
+        )
+        if p
+    )
+    need_bit = _truncate_find_field(need_bit, 48)
+    un = (t.get("requester_username") or "").strip()
+    who = f"@{un}" if un else f"id {t.get('requester_tg_id', '?')}"
+    return f"{sid} | {_status_chip(t.get('status',''))} | {who} | {cca} | {need_bit}"
+
+
+def _sort_tx_by_recent(txs: list[dict[str, str]]) -> list[dict[str, str]]:
+    def rk(rec: dict[str, str]) -> str:
+        return rec.get("updated_at") or rec.get("created_at") or ""
+
+    return sorted(txs, key=rk, reverse=True)
+
+
+async def _reply_find_chunks(
+    msg: Any, header: str, lines: list[str]
+) -> None:
+    """Send header + numbered lines split under Telegram limits."""
+    if not lines:
+        await msg.reply_text(header + "\n\nNo matching rows.")
+        return
+    chunks: list[str] = []
+    cur = header + "\n\n"
+    for ln in lines:
+        addon = ln + "\n"
+        if len(cur) + len(addon) > _FIND_REPLY_SOFT_CHARS:
+            chunks.append(cur.rstrip())
+            cur = addon
+        else:
+            cur += addon
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    for part in chunks:
+        await msg.reply_text(part)
+
 _SESSION_TTL_SEC = max(60, config.SESSION_TTL_MINUTES * 60)
 _MAX_BATCH_LINES = 40
 _RATE_LIMIT_WINDOW_SEC = 15
@@ -260,6 +383,44 @@ def _is_admin(user_id: int) -> bool:
     return user_id in config.ADMIN_TELEGRAM_IDS
 
 
+def _resolve_tx_id_hex_prefix(
+    token: str, rows: list[dict[str, str]], *, none_msg: str, multi_prefix: str
+) -> tuple[str | None, str]:
+    """Match full id or a unique lowercase hex prefix among rows that have ``id``."""
+    tkn = token.strip().lower().replace("-", "")
+    if not tkn:
+        return None, ""
+    if len(tkn) < 6:
+        return None, "Paste at least 6 characters of the id (from the Sheet or borrower message)."
+    if any(c not in "0123456789abcdef" for c in tkn):
+        return None, "Transaction id should be hex digits (and optional dashes), from the `id` column."
+    ids = [t["id"] for t in rows if t.get("id")]
+    for tid in ids:
+        if tid.lower().replace("-", "") == tkn:
+            return tid, ""
+    matches = [t for t in rows if t.get("id", "").lower().replace("-", "").startswith(tkn)]
+    if not matches:
+        return None, none_msg
+    if len(matches) > 1:
+        bits = [f"{m['id'][:12]}…" for m in matches[:5]]
+        extra = "" if len(matches) <= 5 else f" (+{len(matches) - 5} more)"
+        return None, multi_prefix + "\n" + "\n".join(bits) + extra
+    return matches[0]["id"], ""
+
+
+def _resolve_pending_admin_tx_id(token: str, pending: list[dict[str, str]]) -> tuple[str | None, str]:
+    """Match full id or a unique lowercase hex prefix among pending_admin rows."""
+    return _resolve_tx_id_hex_prefix(
+        token,
+        pending,
+        none_msg=(
+            "No pending_admin row matches that id. Check the Sheet id column, "
+            "or open Pending loans."
+        ),
+        multi_prefix="Several pending requests match that prefix. Paste more of the hex id:",
+    )
+
+
 def _verified(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     sessions: dict[int, float] = context.application.bot_data["unlocked_until"]
     now_m = time.monotonic()
@@ -311,20 +472,203 @@ async def _admin_audit(
         logger.warning("Admin audit write failed for action=%s tx_id=%s", action, tx_id)
 
 
+async def _maybe_dm_requester(bot: Any, requester_tg_id: str | None, text: str) -> bool:
+    """Notify borrower in private chat. False if Telegram blocked delivery (often user never pressed /start)."""
+    rid = (requester_tg_id or "").strip()
+    if not rid.isdigit():
+        return False
+    try:
+        await bot.send_message(chat_id=int(rid), text=text)
+        return True
+    except TelegramError:
+        logger.warning("Borrower DM failed for tg_id=%s", rid[:6])
+        return False
+
+
+async def _approve_pending_loan_as_requested(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    tx_id: str,
+    admin_user: Any,
+) -> tuple[bool, str, bool]:
+    """Apply sheet update, audit, borrower DM. Returns (sheet_ok, admin_error_hint, borrower_dm_sent)."""
+    try:
+        t = await _sheet(sheets.find_transaction, CRED, SHEET, tx_id)
+    except SheetsBackendError:
+        return False, SHEET_ERROR_TEXT, False
+    if not t:
+        return False, "Transaction not found.", False
+    if t.get("status") != sheets.STATUS_PENDING_ADMIN:
+        return False, f"Not waiting for logistics (status is {t.get('status','')}).", False
+    now = sheets.now_iso()
+    ni, nq, nr = (
+        (t.get("need_item") or "").strip(),
+        (t.get("need_qty") or "").strip(),
+        (t.get("need_reason") or "").strip(),
+    )
+    try:
+        ok = await _sheet(
+            sheets.update_transaction,
+            CRED,
+            SHEET,
+            tx_id,
+            {
+                "loan_item": ni,
+                "loan_qty": nq,
+                "loan_reason": nr,
+                "admin_tg_id": str(admin_user.id),
+                "admin_username": admin_user.username or "",
+                "loan_recorded_at": now,
+                "status": sheets.STATUS_AWAITING_ACK,
+            },
+        )
+    except SheetsBackendError:
+        return False, SHEET_ERROR_TEXT, False
+    if not ok:
+        return False, "Could not update the sheet.", False
+    await _admin_audit(
+        context,
+        action="loan_approved_as_requested",
+        admin_user=admin_user,
+        tx_id=tx_id,
+        notes="Loan mirrors request; borrower notified",
+    )
+    cca = (t.get("cca") or "").strip() or "(CCA not set)"
+    need_one = _fmt_need_row(t)
+    short = tx_id[:10]
+    body = (
+        "✅ Your loan request was approved.\n\n"
+        f"{need_one}\n"
+        f"CCA: {cca}\n\n"
+        "Please open this bot, tap My loans, then Sign / acknowledge. "
+        "Enter your full name and type CONFIRM — that confirms you received the gear and locks the loan on our records.\n\n"
+        f"Reference id: {short}…"
+    )
+    dm_ok = await _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body)
+    return True, "", dm_ok
+
+
+async def _reject_pending_loan_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    tx_id: str,
+    admin_user: Any,
+) -> tuple[bool, str, bool]:
+    """Mark cancelled, audit, notify borrower."""
+    try:
+        t = await _sheet(sheets.find_transaction, CRED, SHEET, tx_id)
+    except SheetsBackendError:
+        return False, SHEET_ERROR_TEXT, False
+    if not t:
+        return False, "Transaction not found.", False
+    if t.get("status") != sheets.STATUS_PENDING_ADMIN:
+        return False, f"Not waiting for logistics (status is {t.get('status','')}).", False
+    try:
+        ok = await _sheet(
+            sheets.update_transaction,
+            CRED,
+            SHEET,
+            tx_id,
+            {
+                "status": sheets.STATUS_CANCELLED,
+                "admin_tg_id": str(admin_user.id),
+                "admin_username": admin_user.username or "",
+            },
+        )
+    except SheetsBackendError:
+        return False, SHEET_ERROR_TEXT, False
+    if not ok:
+        return False, "Could not update the sheet.", False
+    await _admin_audit(
+        context,
+        action="loan_request_rejected",
+        admin_user=admin_user,
+        tx_id=tx_id,
+        notes="Marked cancelled; borrower notified",
+    )
+    cca = (t.get("cca") or "").strip() or "(CCA not set)"
+    body = (
+        "❌ Your loan request was not approved by logistics.\n\n"
+        f"{_fmt_need_row(t)}\n"
+        f"CCA: {cca}\n\n"
+        "If you still need equipment, check with logistics or submit a new request when appropriate.\n\n"
+        f"Reference id: {tx_id[:10]}…"
+    )
+    dm_ok = await _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body)
+    return True, "", dm_ok
+
+
 def _main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     rows: list[list[KeyboardButton]] = [
         [KeyboardButton("New request"), KeyboardButton("My loans")],
-        [KeyboardButton("Return an item"), KeyboardButton("Edit a request")],
-        [KeyboardButton("Exit / Cancel")],
+        [KeyboardButton("Edit a request")],
     ]
     if _is_admin(user_id):
+        rows.append([KeyboardButton(LABEL_HELP), KeyboardButton(LABEL_SEARCH)])
+    else:
+        rows.append([KeyboardButton(LABEL_HELP)])
+    rows.append([KeyboardButton("Exit / Cancel")])
+    if _is_admin(user_id):
         rows.append(
-            [
-                KeyboardButton("Admin: pending loans"),
-                KeyboardButton("Admin: pending returns"),
-            ]
+            [KeyboardButton(LABEL_PENDING_LOANS), KeyboardButton(LABEL_PENDING_RETURNS)]
         )
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _signing_name_keyboard() -> ReplyKeyboardMarkup:
+    """Shows only Escape during name entry (main menu hides after inline taps on some clients)."""
+    return ReplyKeyboardMarkup([[KeyboardButton("Exit / Cancel")]], resize_keyboard=True)
+
+
+def _signing_confirm_keyboard() -> ReplyKeyboardMarkup:
+    """Tappable CONFIRM + Exit instead of relying on hidden main keyboard."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("CONFIRM")], [KeyboardButton("Exit / Cancel")]],
+        resize_keyboard=True,
+    )
+
+
+def _clear_ui_flow_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop wizard state for borrower/admin input flows."""
+    ud = context.user_data
+    ud.pop("expect_loan_for", None)
+    ud.pop("flow", None)
+    ud.pop("pending_group", None)
+    ud.pop("pending_cca", None)
+    ud.pop("pending_ack_tx", None)
+    ud.pop("pending_ack_name", None)
+    ud.pop("pending_ack_action", None)
+    ud.pop("myloans_cca_options", None)
+
+
+async def _abort_user_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int
+) -> None:
+    """Clear in-progress flows and always restore the main menu keyboard.
+
+    Duplicate Exit/Cancel updates in a short burst only send the word "Cancelled." once,
+    but still re-apply the main keyboard (so you are not stuck on Group/Club picker keys).
+    """
+    _clear_ui_flow_user_data(context)
+    if not update.message:
+        return
+    kb = _main_keyboard(uid)
+    now_m = time.monotonic()
+    deb: dict[int, float] = context.application.bot_data.setdefault(
+        "cancel_reply_last_ts", {}
+    )
+    last_verbal = deb.get(uid)
+    say_cancelled = (
+        last_verbal is None or now_m - last_verbal >= _REPLY_KEYBOARD_DUPLICATE_BURST_SEC
+    )
+    msg = "Cancelled." if say_cancelled else "\u200c"
+    try:
+        await update.message.reply_text(msg, reply_markup=kb)
+    except TelegramError:
+        logger.exception("abort_user_flow: reply failed")
+        return
+    if say_cancelled:
+        deb[uid] = now_m
 
 
 def _cca_help_sentence() -> str:
@@ -342,14 +686,17 @@ def _help_text(*, include_admin: bool) -> str:
         "Loan requests and returns are logged to a Google Sheet: who asked, what went out, "
         "when both sides confirmed, and when gear came back.",
         "",
-        "Commands",
-        "/start — Intro and keyboard (after you unlock)",
-        "/reset — Clear current flow and refresh buttons",
-        "/help — This full guide",
-        "/whoami — Show your Telegram ID and role",
-        "/status <tx_id> — Show one transaction status",
-        "/cancelreq <tx_id> — Cancel your own request if entered by mistake",
-        "/editreq <tx_id> — Cancel your pending request and re-enter it",
+        "Buttons (bottom of chat)",
+        "Help — this guide · Exit / Cancel — leave a step without losing unlock",
+        "",
+        "Commands (optional)",
+        "/start — Refresh intro and keyboard",
+        "/reset — Clear stuck wizard state",
+        "/help — Same as Help button",
+        "/whoami — Your Telegram ID and role",
+        "/status <tx_id> — Detail for one loan",
+        "/return <tx_id> — After sign-off (on loan): start return with Sheet id from the log",
+        "/cancelreq / /editreq <tx_id> — Cancel / redo your own pending request",
         "",
         "Borrower workflow",
         "1) Unlock — First time here: send the shared passcode (only in this private chat). "
@@ -362,27 +709,31 @@ def _help_text(*, include_admin: bool) -> str:
         "",
         _cca_help_sentence(),
         "",
-        "3) Logistics enters what they actually loaned; then you open My loans.",
+        "3) Logistics okays or rejects the request — you get a Telegram message — then open My loans to acknowledge if approved.",
         "",
         '4) Tap Sign / acknowledge, enter full name, then type CONFIRM to sign receipt.',
         "",
-        "5) Return an item — When you're bringing gear back; logistics approves to close the loan.",
+        "5) Returning gear — Only after step 4 (signed receipt → row is on loan): send /return with the transaction id "
+        "from the Sheet log or My loans. Logistics approves under Pending returns.",
         "6) Edit a request — pick one pending request to cancel and immediately resubmit.",
         "",
         "Tips",
-        "• If the format is wrong, the bot sends the template again.",
-        "• Use the buttons at the bottom of the chat — they're faster than typing commands.",
-        "• Tap Exit / Cancel any time to leave the current input flow.",
+        "• If the format is wrong, the bot shows the template again.",
+        "• Prefer the bottom buttons — less typing.",
+        "• Stuck menus? Tap Exit / Cancel, or send /reset, then Help.",
     ]
     if include_admin:
         lines.extend(
             [
                 "",
                 "— Logistics (you are an admin) —",
-                "• Admin: pending loans — Pick a request, then send item, qty, reason for what you handed out.",
-                "• Admin: pending returns — Approve when the item is physically back.",
+                "• Pending loans — Approve / Reject; borrower is messaged either way.",
+                "• /recordloan <id> or /rejectloan <id> — same as buttons, using Sheet id.",
+                "• Search /find — admins only (by Telegram id, club, keyword…).",
+                "• Pending returns — tap when gear is physically back.",
                 "• /adminlog — Show latest admin audit entries.",
                 "• /pending — Quick counts of pending queues.",
+                "• /backupnow — Create a timestamped backup sheet snapshot.",
             ]
         )
     return "\n".join(lines)
@@ -432,6 +783,12 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- Session: {status}\n\n"
         "Send this Telegram ID to maintainer if you should be admin."
     )
+    if role != "admin":
+        text += (
+            '\n\nStill seeing "member" after you were added? '
+            "Put this numeric id into ADMIN_TELEGRAM_IDS as digits only (not @username), "
+            "then restart or redeploy the bot so env changes load."
+        )
     try:
         await update.message.reply_text(
             text,
@@ -500,6 +857,112 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _reply_markdown_safe(update.message, msg)
 
 
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search sheet-backed transactions — admins only (full sheet scope)."""
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("Use /find in private chat.")
+        return
+    uid = update.effective_user.id
+    if not _verified(context, uid):
+        await update.message.reply_text("Session not unlocked. Send passcode first.")
+        return
+    if not _is_admin(uid):
+        await update.message.reply_text(
+            "/find is for logistics admins only.\nYour loans are under My loans; see Help.",
+            reply_markup=_main_keyboard(uid),
+        )
+        return
+
+    parts = list(context.args or [])
+    if not parts or parts[0].lower() in ("help", "?"):
+        await update.message.reply_text(_find_usage_text())
+        return
+
+    mode = parts[0].casefold()
+    needle = " ".join(parts[1:]).strip()
+    if not needle:
+        await update.message.reply_text(
+            f"Missing text after `{mode}`.\n\n{_find_usage_text()}"
+        )
+        return
+
+    try:
+        txs = await _sheet(sheets.list_transactions, CRED, SHEET)
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+
+    pool = txs
+
+    matched: list[dict[str, str]] = []
+
+    if mode in {"tg", "tele", "user"}:
+        digits = "".join(ch for ch in needle if ch.isdigit())
+        if not digits:
+            await update.message.reply_text(
+                "Use digits only for Telegram user id — same number as /whoami for that person."
+            )
+            return
+        matched = [t for t in pool if (t.get("requester_tg_id") or "") == digits]
+    elif mode in {"id", "tx"}:
+        hx = "".join(ch for ch in needle.lower() if ch in "0123456789abcdef")
+        if len(hx) < 4:
+            await update.message.reply_text("Use at least 4 hex characters of the transaction id.")
+            return
+        matched = [
+            t
+            for t in pool
+            if (t.get("id") or "").lower().replace("-", "").startswith(hx)
+        ]
+    elif mode in {"club", "cca"}:
+        nf = needle.casefold()
+        matched = [t for t in pool if nf in (t.get("cca") or "").casefold()]
+    elif mode in {"keyword", "kw", "q", "text"}:
+        nf = needle.casefold()
+
+        def haystack(rec: dict[str, str]) -> str:
+            return " ".join(
+                [
+                    rec.get("cca", ""),
+                    rec.get("need_item", ""),
+                    rec.get("need_qty", ""),
+                    rec.get("need_reason", ""),
+                    rec.get("loan_item", ""),
+                    rec.get("loan_qty", ""),
+                    rec.get("loan_reason", ""),
+                    rec.get("requester_username", ""),
+                    rec.get("requester_display_name", ""),
+                    rec.get("requester_tg_id", ""),
+                    rec.get("id", ""),
+                    rec.get("status", ""),
+                ]
+            ).casefold()
+
+        matched = [t for t in pool if nf in haystack(t)]
+    elif mode == "status":
+        st = needle.strip().lower().replace(" ", "_").replace("-", "_")
+        matched = [t for t in pool if (t.get("status") or "").strip().lower() == st]
+    else:
+        await update.message.reply_text(
+            f'Unknown mode "{parts[0]}". Use tg, id, club, keyword, or status.\n\n'
+            f"{_find_usage_text()}"
+        )
+        return
+
+    ordered = _sort_tx_by_recent(matched)
+    total = len(ordered)
+    shown = ordered[:_FIND_MAX_RESULTS]
+    clipped = total > len(shown)
+
+    hdr = f'Find {mode}: "{needle}" — {total} row(s).' + (
+        " Showing first " + str(len(shown)) + "." if clipped else ""
+    )
+    linelist = [_format_find_hit(t) for t in shown]
+    await _reply_find_chunks(update.message, hdr, linelist)
+
+
 async def cmd_adminlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -554,6 +1017,207 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_recordloan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve one pending_admin row by Sheet id (same as Approve in Pending loans)."""
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("Use /recordloan in private chat.")
+        return
+    uid = update.effective_user.id
+    if not _verified(context, uid):
+        await update.message.reply_text("Session not unlocked. Send passcode first.")
+        return
+    if not _is_admin(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    joined = "".join(context.args).strip()
+    token = "".join(ch for ch in joined.lower() if ch in "0123456789abcdef")
+    if len(token) < 6:
+        await update.message.reply_text(
+            "Usage: /recordloan <transaction_id>\n\n"
+            "Approves the pending request (loan line on the sheet matches what they asked for).\n"
+            "Use the id column from the Google Sheet, or enough leading hex digits to match one row."
+        )
+        return
+    try:
+        txs = await _sheet(sheets.list_transactions, CRED, SHEET)
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+    pending = [t for t in txs if t.get("status") == sheets.STATUS_PENDING_ADMIN]
+    tx_id, err = _resolve_pending_admin_tx_id(token, pending)
+    if not tx_id:
+        await update.message.reply_text(err)
+        return
+    ok, hint, dm_ok = await _approve_pending_loan_as_requested(
+        context, tx_id=tx_id, admin_user=update.effective_user
+    )
+    if not ok:
+        await update.message.reply_text(hint)
+        return
+    msg = (
+        f"Approved {tx_id} on file. Status is now awaiting the borrower's acknowledgement.\n\n"
+    )
+    if dm_ok:
+        msg += "They were sent a Telegram message to open My loans and sign."
+    else:
+        msg += "Could not DM them—ask them to open this bot once and try again, or tell them manually."
+    await update.message.reply_text(msg)
+
+
+async def cmd_rejectloan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Decline one pending_admin request and notify the borrower."""
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("Use /rejectloan in private chat.")
+        return
+    uid = update.effective_user.id
+    if not _verified(context, uid):
+        await update.message.reply_text("Session not unlocked. Send passcode first.")
+        return
+    if not _is_admin(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    joined = "".join(context.args).strip()
+    token = "".join(ch for ch in joined.lower() if ch in "0123456789abcdef")
+    if len(token) < 6:
+        await update.message.reply_text(
+            "Usage: /rejectloan <transaction_id>\n\n"
+            "Rejects a pending request and messages the borrower. "
+            "Use the Sheet id column or a unique hex prefix (same as /recordloan)."
+        )
+        return
+    try:
+        txs = await _sheet(sheets.list_transactions, CRED, SHEET)
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+    pending = [t for t in txs if t.get("status") == sheets.STATUS_PENDING_ADMIN]
+    tx_id, err = _resolve_pending_admin_tx_id(token, pending)
+    if not tx_id:
+        await update.message.reply_text(err)
+        return
+    ok, hint, dm_ok = await _reject_pending_loan_admin(
+        context, tx_id=tx_id, admin_user=update.effective_user
+    )
+    if not ok:
+        await update.message.reply_text(hint)
+        return
+    msg = f"Rejected {tx_id} (marked cancelled on the sheet).\n\n"
+    if dm_ok:
+        msg += "The borrower was messaged."
+    else:
+        msg += "Could not DM the borrower — they may need to open the bot once first."
+    await update.message.reply_text(msg)
+
+
+async def cmd_return(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Borrower: start return by pasting Sheet id (same update as the old Return button)."""
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("Use /return in private chat.")
+        return
+    uid = update.effective_user.id
+    if not _verified(context, uid):
+        await update.message.reply_text("Session not unlocked. Send passcode first.")
+        return
+    joined = "".join(context.args).strip()
+    token = "".join(ch for ch in joined.lower() if ch in "0123456789abcdef")
+    if len(token) < 6:
+        await update.message.reply_text(
+            "Usage: /return <transaction_id>\n\n"
+            "Paste the id from the Sheet log or My loans (full id or enough hex digits to match one row). "
+            "You still need Sign / acknowledge (name + CONFIRM) first — until then status is not on loan and /return will not apply.\n\n"
+            "When you're bringing gear back, logistics closes the loop under Pending returns.",
+            reply_markup=_main_keyboard(uid),
+        )
+        return
+    try:
+        txs = await _sheet(sheets.list_transactions, CRED, SHEET)
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+    mine_returnable = [
+        t
+        for t in txs
+        if t.get("requester_tg_id") == str(uid)
+        and t.get("status")
+        in (sheets.STATUS_ON_LOAN, sheets.STATUS_PENDING_RETURN)
+    ]
+    tx_id, err = _resolve_tx_id_hex_prefix(
+        token,
+        mine_returnable,
+        none_msg=(
+            "No matching loan for you with that id. Use the `id` from the log or My loans. "
+            "If it's still awaiting your sign-off, open My loans and Sign first."
+        ),
+        multi_prefix="Several of your loans match that prefix. Paste more of the hex id:",
+    )
+    if not tx_id:
+        await update.message.reply_text(err, reply_markup=_main_keyboard(uid))
+        return
+    t = next((r for r in txs if r.get("id") == tx_id), None)
+    if not t:
+        await update.message.reply_text("Transaction not found.", reply_markup=_main_keyboard(uid))
+        return
+    if t.get("status") == sheets.STATUS_PENDING_RETURN:
+        await update.message.reply_text(
+            "That loan is already waiting for logistics to approve the return.",
+            reply_markup=_main_keyboard(uid),
+        )
+        return
+    now = sheets.now_iso()
+    try:
+        ok = await _sheet(
+            sheets.update_transaction,
+            CRED,
+            SHEET,
+            tx_id,
+            {"return_requested_at": now, "status": sheets.STATUS_PENDING_RETURN},
+        )
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+    if not ok:
+        await update.message.reply_text("Could not update the sheet.", reply_markup=_main_keyboard(uid))
+        return
+    await update.message.reply_text(
+        "Return requested. Logistics will approve it in the bot when the item is back.",
+        reply_markup=_main_keyboard(uid),
+    )
+
+
+async def cmd_backupnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    uid = update.effective_user.id
+    if not _is_admin(uid):
+        await update.message.reply_text("Admin only.")
+        return
+    if not _verified(context, uid):
+        await update.message.reply_text("Session not unlocked. Send passcode first.")
+        return
+    try:
+        name = await _sheet(sheets.backup_main_sheet, CRED, SHEET)
+    except SheetsBackendError:
+        await update.message.reply_text(SHEET_ERROR_TEXT)
+        return
+    await _admin_audit(
+        context,
+        action="backup_created",
+        admin_user=update.effective_user,
+        notes=f"Created worksheet snapshot: {name}",
+    )
+    await update.message.reply_text(
+        f"Backup created: `{name}`\n"
+        "You can find it as a new worksheet tab in the same Google Sheet.",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_cancelreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -582,7 +1246,7 @@ async def cmd_cancelreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if current in (sheets.STATUS_ON_LOAN, sheets.STATUS_PENDING_RETURN):
         await update.message.reply_text(
-            "Cannot cancel after items are on loan/returning. Use normal return flow."
+            "Cannot cancel after items are on loan/returning. Use /return when turning gear in."
         )
         return
     updates = {"status": sheets.STATUS_CANCELLED}
@@ -680,10 +1344,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("expect_loan_for", None)
     if _verified(context, uid):
         intro = (
-            "You're unlocked — welcome back.\n\n"
-            "Quick reminder: New request → logistics records the loan → you Sign / acknowledge "
-            "under My loans → Return an item when done.\n\n"
-            "Send /help for the full step-by-step guide."
+            "You're unlocked.\n\n"
+            "Reminder: My loans holds sign / acknowledge and returns.\n"
+            "Tap Help for the full guide.\n"
+            + (
+                "Search (/find) is on your keyboard for logistics.\n"
+                if _is_admin(uid)
+                else ""
+            )
+            + "\nUse /reset if a menu feels stuck."
         )
         try:
             await update.message.reply_text(
@@ -722,47 +1391,17 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_user_text(update, context)
         return
 
-    now_m = time.monotonic()
-    lock_until = _pass_lock_until.get(uid)
-    if lock_until is not None and now_m < lock_until:
-        mins = max(1, int((lock_until - now_m) // 60) + 1)
-        try:
-            await update.message.reply_text(
-                f"Too many wrong attempts. Try again in about {mins} minute(s)."
-            )
-        except TelegramError:
-            logger.exception("try_passcode: lockout reply failed")
-        return
-    if lock_until is not None and now_m >= lock_until:
-        _pass_lock_until.pop(uid, None)
-        _pass_failures.pop(uid, None)
-
     guess = update.message.text.strip()
     try:
         match = secrets.compare_digest(guess, config.BOT_PASSCODE)
     except ValueError:
         match = False
     if not match:
-        n = _pass_failures.get(uid, 0) + 1
-        _pass_failures[uid] = n
         try:
-            if n >= _MAX_PASS_FAILS:
-                _pass_lock_until[uid] = now_m + _LOCKOUT_SEC
-                _pass_failures.pop(uid, None)
-                await update.message.reply_text(
-                    "Too many wrong passcodes. This account is temporarily blocked "
-                    f"from trying again for {_LOCKOUT_SEC // 60} minutes."
-                )
-            else:
-                await update.message.reply_text(
-                    f"Wrong passcode ({n}/{_MAX_PASS_FAILS} before temporary lockout)."
-                )
+            await update.message.reply_text("Wrong passcode. Try again.")
         except TelegramError:
             logger.exception("try_passcode: unauthorized reply failed")
         return
-
-    _pass_failures.pop(uid, None)
-    _pass_lock_until.pop(uid, None)
 
     _unlock_session(context, uid)
     if _is_admin(uid):
@@ -774,11 +1413,19 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     try:
         await update.message.reply_text(
-            "Unlocked.\n\n"
-            "Use the bottom buttons: New request, My loans, Return an item. "
-            "Admins also see Admin: pending loans / pending returns.\n\n"
-            f"Session expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity.\n"
-            "Send /help for how the whole flow works (sheet logging, Sign / acknowledge, returns).",
+            "Unlocked. Here's the bottom menu:\n\n"
+            "• New request · My loans\n"
+            "• Edit a request\n"
+            + (
+                "• Help · Search (Sheet lookups · admins)\n"
+                "• Exit / Cancel\n\n"
+                "Admin bottom row: Pending loans · Pending returns\n"
+                if _is_admin(uid)
+                else "• Help\n"
+                     "• Exit / Cancel\n"
+            )
+            + f"\nIdle ~{config.SESSION_TTL_MINUTES} min — you'll need the passcode again.\n"
+            "Questions? Tap Help.",
             reply_markup=_main_keyboard(uid),
         )
     except TelegramError:
@@ -796,14 +1443,12 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         await update.message.reply_text(
-            "Admin — how approvals work:\n\n"
-            "1) Pending loans = someone requested gear. You pick a row, then send "
-            "item, qty, reason — that records what you actually handed out (approves the loan on our side).\n\n"
-            "2) The borrower then opens My loans and taps Sign / acknowledge — that is their "
-            '"signature" that they received it (full name + CONFIRM).\n\n'
-            "3) Pending returns = borrower started a return. Tap Approve return when the "
-            "physical item is back.\n\n"
-            "Buttons: Admin: pending loans / Admin: pending returns"
+            "Admin — quick reference:\n\n"
+            "1) Pending loans — Approve (ok) or Reject (decline). Borrower gets a DM. "
+            "/recordloan and /rejectloan work too with Sheet id.\n\n"
+            "2) They sign under My loans (name + CONFIRM).\n\n"
+            "3) They return by sending /return + Sheet id; Pending returns — approve when gear is back.\n\n"
+            "Buttons: Pending loans · Pending returns · Search to find rows."
         )
     except TelegramError:
         logger.exception("cmd_admin: help reply failed")
@@ -826,13 +1471,12 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = update.message.text.strip()
     u = update.effective_user
 
+    if text in _CANCEL_TEXTS:
+        await _abort_user_flow(update, context, uid)
+        return
+
     flow = context.user_data.get("flow")
     if flow == USER_FLOW_MYLOANS_CCA:
-        if text == CCA_CANCEL_LABEL:
-            context.user_data.pop("flow", None)
-            context.user_data.pop("myloans_cca_options", None)
-            await update.message.reply_text("Cancelled.", reply_markup=_main_keyboard(uid))
-            return
         options: list[str] = context.user_data.get("myloans_cca_options", [])
         if text not in options:
             await update.message.reply_text(
@@ -850,25 +1494,25 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if flow == USER_FLOW_ACK_NAME:
         if len(text) < 3:
             await update.message.reply_text(
-                "Please enter your full name (at least 3 characters)."
+                "Please enter your full name (at least 3 characters).\n"
+                "(Use Exit / Cancel on the keyboard below if you want to stop.)",
+                reply_markup=_signing_name_keyboard(),
             )
             return
         context.user_data["pending_ack_name"] = text
         context.user_data["flow"] = USER_FLOW_ACK_CONFIRM
-        tx_id = context.user_data.get("pending_ack_tx", "")
-        action = context.user_data.get("pending_ack_action", "ack")
-        action_hint = "complete signature"
         await update.message.reply_text(
-            f"Name captured for `{tx_id}`: {text}\n\n"
-            f"If this is correct, type CONFIRM to {action_hint}.\n"
-            "Or tap Exit / Cancel to abort."
+            f"Captured name: {text}\n\n"
+            "If that's wrong, tap Exit / Cancel and start Sign again from My loans.\n\n"
+            "Otherwise tap CONFIRM below to finish signing.",
+            reply_markup=_signing_confirm_keyboard(),
         )
         return
     if flow == USER_FLOW_ACK_CONFIRM:
         if text != "CONFIRM":
             await update.message.reply_text(
-                "To sign, type exactly: CONFIRM\n"
-                "Or tap Exit / Cancel."
+                "Tap CONFIRM below to finish, or Exit / Cancel to stop.",
+                reply_markup=_signing_confirm_keyboard(),
             )
             return
         tx_id = context.user_data.get("pending_ack_tx", "")
@@ -877,23 +1521,31 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not tx_id:
             context.user_data.pop("flow", None)
             await update.message.reply_text(
-                "Signing session expired. Open My loans and tap Sign / acknowledge again."
+                "Signing session expired. Open My loans and tap Sign / acknowledge again.",
+                reply_markup=_main_keyboard(uid),
             )
             return
         try:
             t = await _sheet(sheets.find_transaction, CRED, SHEET, tx_id)
         except SheetsBackendError:
-            await update.message.reply_text(SHEET_ERROR_TEXT)
+            await update.message.reply_text(
+                SHEET_ERROR_TEXT,
+                reply_markup=_main_keyboard(uid),
+            )
             return
         if not t or t.get("requester_tg_id") != str(uid):
-            await update.message.reply_text("Not found or not yours.")
+            await update.message.reply_text(
+                "Not found or not yours.",
+                reply_markup=_main_keyboard(uid),
+            )
             return
         now = sheets.now_iso()
         try:
             if action == "ack":
                 if t.get("status") != sheets.STATUS_AWAITING_ACK:
                     await update.message.reply_text(
-                        "This item is no longer waiting for acknowledgement."
+                        "This item is no longer waiting for acknowledgement.",
+                        reply_markup=_main_keyboard(uid),
                     )
                     return
                 await _sheet(
@@ -909,60 +1561,41 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     },
                 )
             else:
-                await update.message.reply_text("Unknown confirmation action. Please retry.")
+                await update.message.reply_text(
+                    "Unknown confirmation action. Please retry.",
+                    reply_markup=_main_keyboard(uid),
+                )
                 return
         except SheetsBackendError:
-            await update.message.reply_text(SHEET_ERROR_TEXT)
+            await update.message.reply_text(
+                SHEET_ERROR_TEXT,
+                reply_markup=_main_keyboard(uid),
+            )
             return
         context.user_data.pop("flow", None)
         context.user_data.pop("pending_ack_tx", None)
         context.user_data.pop("pending_ack_name", None)
         context.user_data.pop("pending_ack_action", None)
         await update.message.reply_text(
-            f"Signed by {full_name}. Acknowledgement saved and status is now on loan."
+            f"Signed by {full_name}. Acknowledgement saved and status is now on loan.",
+            reply_markup=_main_keyboard(uid),
         )
         return
 
-    menu_labels = frozenset(
-        {
-            "New request",
-            "My loans",
-            "Return an item",
-            "Edit a request",
-            "Admin: pending loans",
-            "Admin: pending returns",
-            "Exit / Cancel",
-        }
-    )
+    menu_labels = _main_menu_reply_labels()
     if text in menu_labels:
+        if _suppress_duplicate_keyboard_menu_tap(context, uid, text):
+            return
         context.user_data.pop("expect_loan_for", None)
         context.user_data.pop("flow", None)
         context.user_data.pop("pending_group", None)
         context.user_data.pop("pending_cca", None)
-
-    if text in {"Exit / Cancel", CCA_CANCEL_LABEL}:
-        context.user_data.pop("flow", None)
-        context.user_data.pop("pending_group", None)
-        context.user_data.pop("pending_cca", None)
-        context.user_data.pop("expect_loan_for", None)
-        context.user_data.pop("pending_ack_tx", None)
-        context.user_data.pop("pending_ack_name", None)
-        context.user_data.pop("pending_ack_action", None)
-        context.user_data.pop("myloans_cca_options", None)
-        try:
-            await update.message.reply_text(
-                "Cancelled.",
-                reply_markup=_main_keyboard(uid),
-            )
-        except TelegramError:
-            logger.exception("handle_user_text: CCA cancel reply failed")
-        return
 
     if text == "New request":
         context.user_data["flow"] = USER_FLOW_GROUP
         try:
             await update.message.reply_text(
-                "Pick your Group (then you will pick Club).",
+                "Step 1/3: Pick your Group.",
                 reply_markup=_options_keyboard(list(CLUB_GROUPS.keys())),
             )
         except TelegramError:
@@ -995,84 +1628,33 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=_options_keyboard(options),
         )
         return
-    if text == "Return an item":
-        await show_return_choices(update, context, uid)
-        return
     if text == "Edit a request":
         await show_edit_choices(update, context, uid)
         return
-    if text == "Admin: pending loans":
+    if text == LABEL_HELP:
+        await cmd_help(update, context)
+        return
+    if text == LABEL_SEARCH:
+        if not _is_admin(uid):
+            await update.message.reply_text(
+                "Search (/find) is only for logistics admins.\n"
+                "Use My loans for your borrowing, Help for instructions.",
+                reply_markup=_main_keyboard(uid),
+            )
+            return
+        if _suppress_duplicate_keyboard_menu_tap(context, uid, text):
+            return
+        _clear_ui_flow_user_data(context)
+        await update.message.reply_text(
+            _find_usage_text(),
+            reply_markup=_main_keyboard(uid),
+        )
+        return
+    if text in (LABEL_PENDING_LOANS, _LEGACY_PENDING_LOANS):
         await admin_pending_loans(update, context)
         return
-    if text == "Admin: pending returns":
+    if text in (LABEL_PENDING_RETURNS, _LEGACY_PENDING_RETURNS):
         await admin_pending_returns(update, context)
-        return
-
-    if _is_admin(uid) and context.user_data.get("expect_loan_for"):
-        parsed_loan = parse_three_csv_fields(text)
-        if not parsed_loan:
-            try:
-                await update.message.reply_text(
-                    "Loan details must use the same three-part format:\n\n"
-                    f"{FORMAT_HELP}\n\n"
-                    "Example for what you physically handed out: Mic set A, 1, signed out from store\n"
-                    "(for one selected request, send one line only)."
-                )
-            except TelegramError:
-                logger.exception("handle_user_text: loan format reply failed")
-            return
-        item, qty, reason = parsed_loan
-        tx_id = context.user_data["expect_loan_for"]
-        now = sheets.now_iso()
-        try:
-            ok = await _sheet(
-                sheets.update_transaction,
-                CRED,
-                SHEET,
-                tx_id,
-                {
-                    "loan_item": item,
-                    "loan_qty": qty,
-                    "loan_reason": reason,
-                    "admin_tg_id": str(uid),
-                    "admin_username": u.username or "",
-                    "loan_recorded_at": now,
-                    "status": sheets.STATUS_AWAITING_ACK,
-                },
-            )
-        except SheetsBackendError:
-            try:
-                await update.message.reply_text(SHEET_ERROR_TEXT)
-            except TelegramError:
-                logger.exception("handle_user_text: sheet error reply failed")
-            return
-        context.user_data.pop("expect_loan_for", None)
-        try:
-            if ok:
-                await _admin_audit(
-                    context,
-                    action="loan_recorded",
-                    admin_user=u,
-                    tx_id=tx_id,
-                    notes=f"Recorded loan details: {item} x {qty}",
-                )
-                await update.message.reply_text(
-                    f"Loan approved on file for `{tx_id}`.\n\n"
-                    "Tell the borrower to open My loans and tap Acknowledge "
-                    '(their "signature" that they received the items).',
-                    parse_mode="Markdown",
-                )
-            else:
-                await _admin_audit(
-                    context,
-                    action="loan_record_failed_missing_tx",
-                    admin_user=u,
-                    tx_id=tx_id,
-                    notes="Attempted to record loan but transaction id not found",
-                )
-                await update.message.reply_text("That transaction id was not found.")
-        except TelegramError:
-            logger.exception("handle_user_text: loan confirmation reply failed")
         return
 
     flow = context.user_data.get("flow")
@@ -1090,7 +1672,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["flow"] = USER_FLOW_CLUB
         try:
             await update.message.reply_text(
-                f"Group: {text}\nNow pick Club.",
+                f"Step 2/3: Group selected: {text}\nNow pick your Club.",
                 reply_markup=_options_keyboard(list(CLUB_GROUPS[text]), include_back=True),
             )
         except TelegramError:
@@ -1124,7 +1706,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["flow"] = USER_FLOW_DESC
         try:
             await update.message.reply_text(
-                f"What do you need to borrow? Send one message:\n{FORMAT_HELP}",
+                f"Step 3/3: Enter what you need.\n{FORMAT_HELP}",
                 reply_markup=_main_keyboard(uid),
             )
         except TelegramError:
@@ -1257,23 +1839,26 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             if len(tx_ids) == 1:
                 await update.message.reply_text(
-                    f"Logged request `{tx_ids[0]}`. Logistics will record what was loaned next.",
-                    parse_mode="Markdown",
+                    f"Saved request {tx_ids[0]}.\n"
+                    "Logistics sees it under Pending loans (Approve / Reject)."
                 )
             else:
                 shown = ", ".join(tx_ids[:10])
                 extra = "" if len(tx_ids) <= 10 else f" (+{len(tx_ids) - 10} more)"
                 await update.message.reply_text(
-                    f"Logged {len(tx_ids)} requests for this CCA.\n"
+                    f"Saved {len(tx_ids)} requests.\n"
                     f"IDs: {shown}{extra}\n"
-                    "Logistics can now process them in Admin: pending loans."
+                    "Logistics opens Pending loans to approve or reject each."
                 )
         except TelegramError:
             logger.exception("handle_user_text: success reply failed")
         return
 
     try:
-        await update.message.reply_text("Use the menu buttons, or send /help for instructions.")
+        await update.message.reply_text(
+            "Lost? Tap Help below.",
+            reply_markup=_main_keyboard(uid),
+        )
     except TelegramError:
         logger.exception("handle_user_text: default hint reply failed")
 
@@ -1315,7 +1900,7 @@ async def show_my_loans(
         sid = t["id"]
         st = t.get("status", "")
         lines.append(
-            f"• `{sid}` [{st}]\n  CCA: {t.get('cca','')}\n"
+            f"• `{sid}` [{_status_chip(st)}]\n  CCA: {t.get('cca','')}\n"
             f"  {_fmt_need_row(t)}\n"
             f"  {_fmt_loan_row(t)}"
         )
@@ -1329,59 +1914,15 @@ async def show_my_loans(
                 ]
             )
     header = (
-        "Your loans — if status is awaiting_user_ack, tap Sign / acknowledge, then "
-        "enter full name and type CONFIRM.\n\n"
+        "Your loans\n"
+        "(🟠 = needs your sign-off — tap Sign, enter name, then type CONFIRM.)\n"
+        "🟢 on loan (after you signed) → when returning gear, send /return with the id from below or the Sheet log.\n\n"
     )
     await _reply_markdown_safe(
         update.message,
         header + ("\n\n".join(lines) or "Nothing to show."),
         reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
     )
-
-
-async def show_return_choices(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int
-) -> None:
-    if not update.message:
-        return
-    try:
-        txs = await _sheet(sheets.list_transactions, CRED, SHEET)
-    except SheetsBackendError:
-        try:
-            await update.message.reply_text(SHEET_ERROR_TEXT)
-        except TelegramError:
-            logger.exception("show_return_choices: sheet error reply failed")
-        return
-    mine = [
-        t
-        for t in txs
-        if t.get("requester_tg_id") == str(uid)
-        and t.get("status") == sheets.STATUS_ON_LOAN
-    ]
-    if not mine:
-        try:
-            await update.message.reply_text(
-                "You have nothing on loan that can be returned yet."
-            )
-        except TelegramError:
-            logger.exception("show_return_choices: empty reply failed")
-        return
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"Return {t['id'][:6]}…",
-                callback_data=f"rtn:{t['id']}",
-            )
-        ]
-        for t in mine[-15:]
-    ]
-    try:
-        await update.message.reply_text(
-            "Pick the item you are returning. Logistics must approve before it is marked returned.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-    except TelegramError:
-        logger.exception("show_return_choices: keyboard reply failed")
 
 
 async def show_edit_choices(
@@ -1448,25 +1989,28 @@ async def admin_pending_loans(
     pending = [t for t in txs if t.get("status") == sheets.STATUS_PENDING_ADMIN]
     if not pending:
         try:
-            await update.message.reply_text("No requests waiting for loan details.")
+            await update.message.reply_text(
+                "No pending approvals — queue is empty."
+            )
         except TelegramError:
             logger.exception("admin_pending_loans: empty reply failed")
         return
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"Record loan {t['id'][:6]}…",
-                callback_data=f"pv:{t['id']}",
-            )
-        ]
-        for t in pending[-20:]
-    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for t in pending[-20:]:
+        tid = t.get("id")
+        if not tid:
+            continue
+        buttons.append(
+            [
+                InlineKeyboardButton(f"Approve {tid[:6]}…", callback_data=f"apv:{tid}"),
+                InlineKeyboardButton(f"Reject {tid[:6]}…", callback_data=f"rej:{tid}"),
+            ]
+        )
     try:
         await update.message.reply_text(
-            "Approve by recording what you actually handed out.\n"
-            "Pick a request, then send one line:\n"
-            "item, qty, reason\n"
-            "(same format as borrowers). That moves it to awaiting their acknowledgement.",
+            "Approve = notify borrower → they tap My loans → Sign.\n"
+            "Reject = cancel request + DM them.\n\n"
+            "Also works: /recordloan <id>, /rejectloan <id>. Search finds rows.",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except TelegramError:
@@ -1509,8 +2053,7 @@ async def admin_pending_returns(
         )
     try:
         await update.message.reply_text(
-            "When the physical item is back with you, approve the return below "
-            "(logs time and your Telegram id on the sheet).",
+            "Gear physically back with you?\nTap Approve return below (logs who/when).",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
     except TelegramError:
@@ -1528,17 +2071,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     data = q.data
-    if data.startswith("pv:"):
+    if data.startswith("apv:"):
         if not _is_admin(uid):
             await _edit_callback_message(q, "Admin only.")
             return
         tx_id = data.split(":", 1)[1]
-        context.user_data["expect_loan_for"] = tx_id
-        await _edit_callback_message(
-            q,
-            f"Selected `{tx_id}`. Send one message: item, qty, reason",
-            parse_mode="Markdown",
+        ok, err, dm_ok = await _approve_pending_loan_as_requested(
+            context, tx_id=tx_id, admin_user=update.effective_user
         )
+        if not ok:
+            await _edit_callback_message(q, err)
+            return
+        tail = (
+            " Borrower was messaged."
+            if dm_ok
+            else " Could not DM borrower (they may need to /start the bot once)."
+        )
+        await _edit_callback_message(q, f"Approved on file.{tail}")
+        return
+
+    if data.startswith("rej:"):
+        if not _is_admin(uid):
+            await _edit_callback_message(q, "Admin only.")
+            return
+        tx_id = data.split(":", 1)[1]
+        ok, err, dm_ok = await _reject_pending_loan_admin(
+            context, tx_id=tx_id, admin_user=update.effective_user
+        )
+        if not ok:
+            await _edit_callback_message(q, err)
+            return
+        tail = (
+            " Borrower was messaged." if dm_ok else " Could not DM borrower."
+        )
+        await _edit_callback_message(q, f"Rejected.{tail}")
         return
 
     if data.startswith("ack:"):
@@ -1562,40 +2128,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("pending_ack_name", None)
         await _edit_callback_message(
             q,
-            "Step 1/2: Send your full name as reply in chat.\n"
-            "Then you will type CONFIRM to complete signature.",
+            "Step 1/2: Type your full name in chat as the next message.\n",
         )
-        return
-
-    if data.startswith("rtn:"):
-        tx_id = data.split(":", 1)[1]
-        try:
-            t = await _sheet(sheets.find_transaction, CRED, SHEET, tx_id)
-        except SheetsBackendError:
-            await _edit_callback_message(q, SHEET_ERROR_TEXT)
-            return
-        if not t or t.get("requester_tg_id") != str(uid):
-            await _edit_callback_message(q, "Not found or not yours.")
-            return
-        if t.get("status") != sheets.STATUS_ON_LOAN:
-            await _edit_callback_message(q, "Only active loans can start a return.")
-            return
-        now = sheets.now_iso()
-        try:
-            await _sheet(
-                sheets.update_transaction,
-                CRED,
-                SHEET,
-                tx_id,
-                {"return_requested_at": now, "status": sheets.STATUS_PENDING_RETURN},
-            )
-        except SheetsBackendError:
-            await _edit_callback_message(q, SHEET_ERROR_TEXT)
-            return
-        await _edit_callback_message(
-            q,
-            "Return requested. Logistics will approve it in the bot when the item is back.",
-        )
+        if q.message:
+            try:
+                await q.message.reply_text(
+                    "Under the typing box Telegram shows a keyboard row:\n"
+                    "Exit / Cancel stops signing.\n"
+                    "Otherwise send your full name as your next message.",
+                    reply_markup=_signing_name_keyboard(),
+                )
+            except TelegramError:
+                logger.exception("on_callback ack: signing keyboard reply failed")
         return
 
     if data.startswith("edt:"):
@@ -1613,7 +2157,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _edit_callback_message(
                 q,
                 "Only pending_admin / awaiting_user_ack can be edited. "
-                "If item is already on loan, use return flow first.",
+                "If it is already on loan, send /return with the Sheet transaction id.",
             )
             return
         try:
@@ -1698,6 +2242,7 @@ def main() -> None:
 
     try:
         sheets.ensure_headers(config.GOOGLE_SERVICE_ACCOUNT_FILE, config.GOOGLE_SHEET_ID)
+        sheets.ensure_workbook_extras(config.GOOGLE_SERVICE_ACCOUNT_FILE, config.GOOGLE_SHEET_ID)
     except RuntimeError as e:
         raise SystemExit(str(e)) from e
 
@@ -1717,10 +2262,15 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("cancelreq", cmd_cancelreq))
     app.add_handler(CommandHandler("editreq", cmd_editreq))
+    app.add_handler(CommandHandler("return", cmd_return))
     app.add_handler(CommandHandler("adminlog", cmd_adminlog))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("recordloan", cmd_recordloan))
+    app.add_handler(CommandHandler("rejectloan", cmd_rejectloan))
+    app.add_handler(CommandHandler("backupnow", cmd_backupnow))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(
@@ -1730,6 +2280,10 @@ def main() -> None:
         ),
     )
 
+    logger.info(
+        "Configured %s admin Telegram id(s); /whoami id must match for admin menus.",
+        len(config.ADMIN_TELEGRAM_IDS),
+    )
     logger.info("Starting bot (long polling). For 24/7, keep this process running on a host.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
