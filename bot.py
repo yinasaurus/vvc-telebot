@@ -678,7 +678,6 @@ def _signing_confirm_keyboard() -> ReplyKeyboardMarkup:
 def _clear_ui_flow_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Drop wizard state for borrower/admin input flows."""
     ud = context.user_data
-    ud.pop("expect_loan_for", None)
     ud.pop("flow", None)
     ud.pop("pending_group", None)
     ud.pop("pending_cca", None)
@@ -720,14 +719,6 @@ async def _abort_user_flow(
         return
     if say_cancelled:
         deb[uid] = now_m
-
-
-def _cca_help_sentence() -> str:
-    return (
-        "When you tap New request, you choose Group then Club from buttons "
-        "(no typing, so no typo).\n"
-    )
-
 
 def _help_text(*, include_admin: bool) -> str:
     lines = [
@@ -1394,7 +1385,6 @@ async def cmd_editreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     context.user_data["flow"] = USER_FLOW_GROUP
     context.user_data.pop("pending_group", None)
     context.user_data.pop("pending_cca", None)
-    context.user_data.pop("expect_loan_for", None)
     await update.message.reply_text(
         f"Cancelled `{tx_id}` so you can edit. Now pick your Group to create the corrected request.",
         parse_mode="Markdown",
@@ -1416,7 +1406,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("flow", None)
     context.user_data.pop("pending_group", None)
     context.user_data.pop("pending_cca", None)
-    context.user_data.pop("expect_loan_for", None)
     if _verified(context, uid):
         intro = (
             "You're unlocked.\n\n"
@@ -1688,7 +1677,6 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if text in menu_labels:
         if _suppress_duplicate_keyboard_menu_tap(context, uid, text):
             return
-        context.user_data.pop("expect_loan_for", None)
         context.user_data.pop("flow", None)
         context.user_data.pop("pending_group", None)
         context.user_data.pop("pending_cca", None)
@@ -2285,7 +2273,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["flow"] = USER_FLOW_GROUP
         context.user_data.pop("pending_group", None)
         context.user_data.pop("pending_cca", None)
-        context.user_data.pop("expect_loan_for", None)
         await _edit_callback_message(
             q,
             f"Cancelled `{tx_id}`. Now pick your Group to submit the corrected request.",
