@@ -42,6 +42,27 @@ def _parse_positive_int(raw: str | None, default: int) -> int:
     return n if n > 0 else default
 
 
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_hour(raw: str | None, default: int) -> int:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return default
+    return n
+
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BOT_PASSCODE = os.environ.get("BOT_PASSCODE", "").strip()
 ADMIN_TELEGRAM_IDS_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "").strip()
@@ -70,6 +91,9 @@ if _raw_sa_json:
         SERVICE_ACCOUNT_JSON_ERROR = f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {e}"
 
 SESSION_TTL_MINUTES = _parse_positive_int(os.environ.get("SESSION_TTL_MINUTES"), 30)
+OPERATING_HOURS_ENABLED = _parse_bool(os.environ.get("OPERATING_HOURS_ENABLED"), True)
+OPENING_HOUR_24 = _parse_hour(os.environ.get("OPENING_HOUR_24"), 9)
+CLOSING_HOUR_24 = _parse_hour(os.environ.get("CLOSING_HOUR_24"), 21)
 
 
 def validate_config() -> list[str]:
@@ -99,6 +123,12 @@ def validate_config() -> list[str]:
         errors.append("GOOGLE_SHEET_ID is missing")
     if SESSION_TTL_MINUTES < 1:
         errors.append("SESSION_TTL_MINUTES must be >= 1")
+    if not (0 <= OPENING_HOUR_24 <= 23):
+        errors.append("OPENING_HOUR_24 must be 0..23")
+    if not (0 <= CLOSING_HOUR_24 <= 23):
+        errors.append("CLOSING_HOUR_24 must be 0..23")
+    if OPENING_HOUR_24 == CLOSING_HOUR_24:
+        errors.append("OPENING_HOUR_24 and CLOSING_HOUR_24 cannot be the same")
     if SERVICE_ACCOUNT_JSON_ERROR:
         errors.append(SERVICE_ACCOUNT_JSON_ERROR)
     elif SERVICE_ACCOUNT_INFO is not None:

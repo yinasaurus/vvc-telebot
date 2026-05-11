@@ -8,7 +8,7 @@ Use this in **private chat** with the bot (not groups).
 
 ## How it works (big picture)
 
-1. **Borrower** unlocks the bot with a shared passcode (session-based).
+1. **Borrower** unlocks the bot with a shared passcode (session-based, and only during operating hours if enabled).
 2. **Borrower** creates a **New request**: pick **Group** and **Club** from buttons, then send **item, qty, reason** (see format below).
 3. A new row appears in the sheet with status **pending_admin**.
 4. **Admin** (logistics) opens **Pending loans** on the keyboard and taps **Approve** or **Reject** (or uses `/recordloan` / `/rejectloan`). Borrowers get a **Telegram DM** either way. Approve copies the request onto the loan columns and moves the row to awaiting signature.
@@ -19,6 +19,15 @@ Use this in **private chat** with the bot (not groups).
 9. **Admin** uses **Pending returns** → approves → status **returned**, with approver and time recorded.
 
 If a message does not match the required **three-part comma format**, the bot rejects it and shows the template again.
+
+### Super-short user version
+
+1. Send passcode in private chat.
+2. Tap **New request**.
+3. Send: `item, qty, reason` (example: `HDMI cable, 2, rehearsal`)
+4. Wait for logistics approval.
+5. If approved, open **My loans** and sign (name + `CONFIRM`).
+6. When returning, send `/return <tx_id>`.
 
 ```mermaid
 flowchart TD
@@ -154,7 +163,7 @@ You can optionally maintain:
 
 **Passcode notes:**
 
-- Wrong passcode simply gets a retry message (no lockout table in the bot).
+- Wrong passcode returns troubleshooting hints (check latest passcode in Logs, check typo/case/spacing, contact logistics if bot may be down).
 - Unlock is session-based: after inactivity (`SESSION_TTL_MINUTES`), users must enter passcode again.
 
 ---
@@ -172,6 +181,8 @@ Copy `.env.example` to `.env` and fill in:
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to the service account JSON file (local / file on disk) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional. Entire JSON body as one env value (use on Render instead of a file). If set, it overrides the file. |
 | `SESSION_TTL_MINUTES` | Optional. Session timeout in minutes. After inactivity, passcode is required again. |
+| `OPERATING_HOURS_ENABLED` | Optional. `true/false`. If `true`, the bot auto-replies as inactive outside hours. |
+| `OPENING_HOUR_24` / `CLOSING_HOUR_24` | Optional. Hours in UTC+8 (0..23). Example `9` and `21` means 09:00 to 21:00. |
 
 Share the Google Sheet with the **service account email** (`client_email` inside the JSON) as **Editor**.
 

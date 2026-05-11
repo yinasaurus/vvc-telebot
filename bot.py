@@ -5,6 +5,7 @@ import logging
 import secrets
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from telegram import (
@@ -74,6 +75,19 @@ async def _reply_text(update: Update, text: str) -> None:
             await update.edited_message.reply_text(text)
     except TelegramError:
         logger.exception("Could not send error reply to user")
+
+
+async def _guard_operating_hours(
+    update: Update, *, allow_admin: bool = False
+) -> bool:
+    """Return True when request can proceed; otherwise reply with inactive message."""
+    if _is_within_operating_hours():
+        return True
+    uid = update.effective_user.id if update.effective_user else None
+    if allow_admin and uid is not None and _is_admin(uid):
+        return True
+    await _reply_text(update, _closing_hours_message())
+    return False
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,9 +163,14 @@ USER_FLOW_ACK_CONFIRM = "await_ack_confirm"
 USER_FLOW_MYLOANS_CCA = "await_myloans_cca"
 
 FORMAT_HELP = (
-    "Use exactly three parts separated by commas:\n"
+    "Please send in this format:\n"
     "item, qty, reason\n\n"
-    "Example: HDMI cable, 2, Year-end concert booth"
+    "Meaning:\n"
+    "- item = what you need\n"
+    "- qty = how many\n"
+    "- reason = why you need it\n\n"
+    "Example:\n"
+    "HDMI cable, 2, Year-end concert booth"
 )
 
 CCA_CANCEL_LABEL = "« Cancel"
@@ -331,6 +350,34 @@ _ACTIVE_OUTSTANDING_STATUSES = {
     sheets.STATUS_ON_LOAN,
     sheets.STATUS_PENDING_RETURN,
 }
+
+
+def _operating_hours_text() -> str:
+    return (
+        f"{config.OPENING_HOUR_24:02d}:00 to {config.CLOSING_HOUR_24:02d}:00 "
+        "UTC+8 daily"
+    )
+
+
+def _is_within_operating_hours() -> bool:
+    if not config.OPERATING_HOURS_ENABLED:
+        return True
+    now_sgt = datetime.now(timezone(timedelta(hours=8)))
+    h = now_sgt.hour
+    open_h = config.OPENING_HOUR_24
+    close_h = config.CLOSING_HOUR_24
+    if open_h < close_h:
+        return open_h <= h < close_h
+    # Overnight window (for example 21 -> 6)
+    return h >= open_h or h < close_h
+
+
+def _closing_hours_message() -> str:
+    return (
+        "The bot is currently inactive (outside operating hours).\n\n"
+        f"Operating hours: {_operating_hours_text()}\n"
+        "Please come back during those hours."
+    )
 
 
 def parse_three_csv_fields(text: str) -> tuple[str, str, str] | None:
@@ -684,46 +731,55 @@ def _cca_help_sentence() -> str:
 
 def _help_text(*, include_admin: bool) -> str:
     lines = [
-        "HOW TO USE THIS BOT",
+        "EASY GUIDE",
         "",
-        "What it does",
-        "Loan requests and returns are logged to a Google Sheet: who asked, what went out, "
-        "when both sides confirmed, and when gear came back.",
+        "What this bot does",
+        "This bot helps you request, sign, and return borrowed equipment.",
         "",
-        "Buttons (bottom of chat)",
-        "Help — this guide · Exit / Cancel — stop a step and hide the keyboard (/start or /help brings it back)",
+        "Operating hours",
+        (
+            f"- Active: {_operating_hours_text()}"
+            if config.OPERATING_HOURS_ENABLED
+            else "- Active: always on (operating-hours check is disabled)"
+        ),
         "",
-        "Commands (optional)",
+        "Main buttons (bottom of chat)",
+        "Help = show this guide",
+        "Exit / Cancel = stop current step and hide keyboard",
+        "To show keyboard again: send /start or /help",
+        "",
+        "Useful commands",
         "/start — Refresh intro and keyboard",
-        "/reset — Clear stuck wizard state",
+        "/reset — If you feel stuck",
         "/help — Same as Help button",
-        "/whoami — Your Telegram ID and role",
-        "/status <tx_id> — Detail for one loan",
-        "/return <tx_id> — After sign-off (on loan): start return with Sheet id from the log",
-        "/cancelreq / /editreq <tx_id> — Cancel / redo your own pending request",
+        "/status <tx_id> — Check one request/loan",
+        "/return <tx_id> — Start return (after sign-off)",
+        "/cancelreq / /editreq <tx_id> — Cancel or redo pending request",
         "",
-        "Borrower workflow",
-        "1) Unlock — First time here: send the shared passcode (only in this private chat). "
+        "Step-by-step (borrower)",
+        "1) Unlock: send shared passcode in this private chat. "
         f"Session unlock expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity.",
         "",
-        "2) New request — Send one line per item:",
+        "2) Tap New request.",
+        "3) Pick Group, then Club.",
+        "4) Send one line per item:",
         "   item, qty, reason",
+        "   item = what you need",
+        "   qty = how many",
+        "   reason = why you need it",
         "   Example: HDMI cable, 2, Year-end concert booth",
         "   You can also paste multiple lines at once (or rows copied from a spreadsheet).",
         "",
-        _cca_help_sentence(),
-        "",
-        "3) Logistics okays or rejects the request — you get a Telegram message — then open My loans to acknowledge if approved.",
-        "",
-        '4) Tap Sign / acknowledge, enter full name, then type CONFIRM to sign receipt.',
-        "",
-        "5) Returning gear — Only after step 4 (signed receipt → row is on loan): send /return with the transaction id "
+        "5) Wait for approval/rejection message.",
+        "6) If approved, open My loans and tap Sign / acknowledge.",
+        "7) Type your full name, then tap CONFIRM.",
+        "8) When returning gear, send /return with the transaction id "
         "from the Sheet log or My loans. Logistics approves under Pending returns.",
-        "6) Edit a request — pick one pending request to cancel and immediately resubmit.",
+        "9) Need to change a pending request? Tap Edit a request.",
         "",
         "Tips",
-        "• If the format is wrong, the bot shows the template again.",
-        "• Prefer the bottom buttons — less typing.",
+        "• If format is wrong, bot shows example again.",
+        "• Use buttons whenever possible.",
         "• Stuck menus? Tap Exit / Cancel, or send /reset, then Help.",
     ]
     if include_admin:
@@ -824,6 +880,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    if not await _guard_operating_hours(update):
+        return
     if update.effective_chat and update.effective_chat.type != "private":
         await update.message.reply_text("Use /status in private chat.")
         return
@@ -861,6 +919,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Search sheet-backed transactions — admins only (full sheet scope)."""
     if not update.effective_user or not update.message:
+        return
+    if not await _guard_operating_hours(update):
         return
     if update.effective_chat and update.effective_chat.type != "private":
         await update.message.reply_text("Use /find in private chat.")
@@ -967,6 +1027,8 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_adminlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    if not await _guard_operating_hours(update):
+        return
     uid = update.effective_user.id
     if not _is_admin(uid):
         await update.message.reply_text("Admin only.")
@@ -992,6 +1054,8 @@ async def cmd_adminlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
+        return
+    if not await _guard_operating_hours(update):
         return
     uid = update.effective_user.id
     if not _is_admin(uid):
@@ -1021,6 +1085,8 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_recordloan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Approve one pending_admin row by Sheet id (same as Approve in Pending loans)."""
     if not update.effective_user or not update.message:
+        return
+    if not await _guard_operating_hours(update):
         return
     if update.effective_chat and update.effective_chat.type != "private":
         await update.message.reply_text("Use /recordloan in private chat.")
@@ -1071,6 +1137,8 @@ async def cmd_rejectloan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Decline one pending_admin request and notify the borrower."""
     if not update.effective_user or not update.message:
         return
+    if not await _guard_operating_hours(update):
+        return
     if update.effective_chat and update.effective_chat.type != "private":
         await update.message.reply_text("Use /rejectloan in private chat.")
         return
@@ -1117,6 +1185,8 @@ async def cmd_rejectloan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_return(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Borrower: start return by pasting Sheet id (same update as the old Return button)."""
     if not update.effective_user or not update.message:
+        return
+    if not await _guard_operating_hours(update):
         return
     if update.effective_chat and update.effective_chat.type != "private":
         await update.message.reply_text("Use /return in private chat.")
@@ -1222,6 +1292,8 @@ async def cmd_backupnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_cancelreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    if not await _guard_operating_hours(update):
+        return
     uid = update.effective_user.id
     if not _verified(context, uid):
         await update.message.reply_text("Session not unlocked. Send passcode first.")
@@ -1275,6 +1347,8 @@ async def cmd_cancelreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_editreq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
+        return
+    if not await _guard_operating_hours(update):
         return
     uid = update.effective_user.id
     if not _verified(context, uid):
@@ -1349,6 +1423,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Reminder: My loans holds sign / acknowledge and returns.\n"
             "Tap Help for the full guide.\n"
             + (
+                f"Operating hours: {_operating_hours_text()}\n"
+                if config.OPERATING_HOURS_ENABLED
+                else ""
+            )
+            + (
                 "Search (/find) is on your keyboard for logistics.\n"
                 if _is_admin(uid)
                 else ""
@@ -1363,12 +1442,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError:
             logger.exception("cmd_start: reply failed")
         return
+    hours_line = (
+        f"Operating hours: {_operating_hours_text()}.\n"
+        "Outside these hours, the bot auto-replies as inactive.\n\n"
+        if config.OPERATING_HOURS_ENABLED
+        else ""
+    )
     welcome = (
         "Welcome to the loan bot.\n\n"
-        "It tracks equipment loans in a shared Google Sheet (requests, approvals, signatures, returns). "
-        "Only people with the passcode can use it.\n\n"
-        "Next step: send the shared passcode as your next message right here "
-        "(private chat only — not in groups).\n\n"
+        "You can use this chat to request and return equipment.\n"
+        "Only users with passcode can continue.\n\n"
+        + hours_line
+        + "Next step:\n"
+        "1) Send passcode in this chat.\n"
+        "2) Tap New request.\n"
+        "3) Follow button steps.\n\n"
+        "Important: use this bot in private chat (not groups).\n\n"
         f"Session unlock expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity,\n"
         "then passcode is required again.\n\n"
         "Send /help anytime for a full how-to (even before unlocking)."
@@ -1388,6 +1477,8 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat and update.effective_chat.type != "private":
         return
     uid = update.effective_user.id
+    if not await _guard_operating_hours(update):
+        return
     if _verified(context, uid):
         await handle_user_text(update, context)
         return
@@ -1399,7 +1490,13 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         match = False
     if not match:
         try:
-            await update.message.reply_text("Wrong passcode. Try again.")
+            await update.message.reply_text(
+                "That passcode is not correct.\n\n"
+                "Try this:\n"
+                "1) Check the latest passcode in Logs.\n"
+                "2) Check for typo/caps/extra spaces when pasting.\n"
+                "3) If still failing, the bot may be down or passcode may have changed — contact logistics admin."
+            )
         except TelegramError:
             logger.exception("try_passcode: unauthorized reply failed")
         return
@@ -1436,6 +1533,8 @@ async def try_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
+    if not await _guard_operating_hours(update):
+        return
     if not _is_admin(update.effective_user.id):
         try:
             await update.message.reply_text("Admin only.")
@@ -1459,6 +1558,8 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not update.effective_user or not update.message or not update.message.text:
         return
     uid = update.effective_user.id
+    if not await _guard_operating_hours(update):
+        return
     if not _verified(context, uid):
         return
     if _rate_limited(context, uid):
@@ -1727,10 +1828,10 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
             try:
                 await update.message.reply_text(
-                    f"Line {bad_line} does not match the required format.\n\n"
+                    f"Line {bad_line} is not in the correct format.\n\n"
                     f"{FORMAT_HELP}\n\n"
-                    "You can send one item or many lines at once.\n"
-                    "Tap New request if you want to restart from CCA."
+                    "You can send one item, or many lines at once.\n"
+                    "If needed, tap New request to restart."
                 )
             except TelegramError:
                 logger.exception("handle_user_text: format error reply failed")
@@ -1857,7 +1958,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     try:
         await update.message.reply_text(
-            "Lost? Tap Help below.",
+            "Not sure what to do? Tap Help below.",
             reply_markup=_main_keyboard(uid),
         )
     except TelegramError:
@@ -1976,6 +2077,8 @@ async def admin_pending_loans(
 ) -> None:
     if not update.message or not update.effective_user:
         return
+    if not await _guard_operating_hours(update):
+        return
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
@@ -2023,6 +2126,8 @@ async def admin_pending_returns(
 ) -> None:
     if not update.message or not update.effective_user:
         return
+    if not await _guard_operating_hours(update):
+        return
     if not _is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
@@ -2064,6 +2169,8 @@ async def admin_pending_returns(
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q or not q.data or not update.effective_user:
+        return
+    if not await _guard_operating_hours(update):
         return
     await _callback_ack(q)
     uid = update.effective_user.id
