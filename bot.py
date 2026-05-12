@@ -162,15 +162,22 @@ USER_FLOW_ACK_NAME = "await_ack_full_name"
 USER_FLOW_ACK_CONFIRM = "await_ack_confirm"
 USER_FLOW_MYLOANS_CCA = "await_myloans_cca"
 
+_MAX_BATCH_LINES = 40
+
 FORMAT_HELP = (
-    "Please send in this format:\n"
+    "Please send in this format (one line per item).\n"
+    "You can send several lines in one message — paste from a spreadsheet if you like "
+    f"(max {_MAX_BATCH_LINES} lines).\n\n"
     "item, qty, reason\n\n"
     "Meaning:\n"
     "- item = what you need\n"
     "- qty = how many\n"
     "- reason = why you need it\n\n"
-    "Example:\n"
-    "HDMI cable, 2, Year-end concert booth"
+    "Example (one item):\n"
+    "HDMI cable, 2, Year-end concert booth\n\n"
+    "Example (many items in one message):\n"
+    "HDMI cable, 2, Year-end concert booth\n"
+    "Extension cord, 1, Stage setup"
 )
 
 CCA_CANCEL_LABEL = "« Cancel"
@@ -341,7 +348,6 @@ async def _reply_find_chunks(
         await msg.reply_text(part)
 
 _SESSION_TTL_SEC = max(60, config.SESSION_TTL_MINUTES * 60)
-_MAX_BATCH_LINES = 40
 _RATE_LIMIT_WINDOW_SEC = 15
 _RATE_LIMIT_MAX_MSG = 12
 _ACTIVE_OUTSTANDING_STATUSES = {
@@ -573,13 +579,6 @@ async def _approve_pending_loan_as_requested(
         return False, SHEET_ERROR_TEXT, False
     if not ok:
         return False, "Could not update the sheet.", False
-    await _admin_audit(
-        context,
-        action="loan_approved_as_requested",
-        admin_user=admin_user,
-        tx_id=tx_id,
-        notes="Loan mirrors request; borrower notified",
-    )
     cca = (t.get("cca") or "").strip() or "(CCA not set)"
     need_one = _fmt_need_row(t)
     short = tx_id[:10]
@@ -591,7 +590,16 @@ async def _approve_pending_loan_as_requested(
         "Enter your full name and type CONFIRM — that confirms you received the gear and locks the loan on our records.\n\n"
         f"Reference id: {short}…"
     )
-    dm_ok = await _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body)
+    _, dm_ok = await asyncio.gather(
+        _admin_audit(
+            context,
+            action="loan_approved_as_requested",
+            admin_user=admin_user,
+            tx_id=tx_id,
+            notes="Loan mirrors request; borrower notified",
+        ),
+        _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body),
+    )
     return True, "", dm_ok
 
 
@@ -626,13 +634,6 @@ async def _reject_pending_loan_admin(
         return False, SHEET_ERROR_TEXT, False
     if not ok:
         return False, "Could not update the sheet.", False
-    await _admin_audit(
-        context,
-        action="loan_request_rejected",
-        admin_user=admin_user,
-        tx_id=tx_id,
-        notes="Marked cancelled; borrower notified",
-    )
     cca = (t.get("cca") or "").strip() or "(CCA not set)"
     body = (
         "❌ Your loan request was not approved by logistics.\n\n"
@@ -641,7 +642,16 @@ async def _reject_pending_loan_admin(
         "If you still need equipment, check with logistics or submit a new request when appropriate.\n\n"
         f"Reference id: {tx_id[:10]}…"
     )
-    dm_ok = await _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body)
+    _, dm_ok = await asyncio.gather(
+        _admin_audit(
+            context,
+            action="loan_request_rejected",
+            admin_user=admin_user,
+            tx_id=tx_id,
+            notes="Marked cancelled; borrower notified",
+        ),
+        _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body),
+    )
     return True, "", dm_ok
 
 
@@ -727,6 +737,18 @@ def _help_text(*, include_admin: bool) -> str:
         "What this bot does",
         "This bot helps you request, sign, and return borrowed equipment.",
         "",
+        "Speed & lag (why replies are not instant)",
+        "Almost every step reads or writes the Google Sheet over the internet, so a few seconds of wait is normal.",
+        "Paste many item lines in one message to save time (see below). Approve / reject still updates the sheet before the borrower is messaged.",
+        "",
+        "Borrower — shortest path",
+        "1) Passcode in this chat → New request.",
+        "2) Pick Group, then Club (two taps).",
+        "3) Send your list: one line per item, item, qty, reason — many lines in one message is OK (max "
+        f"{_MAX_BATCH_LINES}).",
+        "4) After approval: My loans → Sign / acknowledge (name + CONFIRM).",
+        "5) Return: /return <transaction id> — you get a short DM when logistics marks it returned.",
+        "",
         "Operating hours",
         (
             f"- Active: {_operating_hours_text()}"
@@ -747,26 +769,13 @@ def _help_text(*, include_admin: bool) -> str:
         "/return <tx_id> — Start return (after sign-off)",
         "/cancelreq / /editreq <tx_id> — Cancel or redo pending request",
         "",
-        "Step-by-step (borrower)",
-        "1) Unlock: send shared passcode in this private chat. "
-        f"Session unlock expires after about {config.SESSION_TTL_MINUTES} minute(s) of inactivity.",
-        "",
-        "2) Tap New request.",
-        "3) Pick Group, then Club.",
-        "4) Send one line per item:",
-        "   item, qty, reason",
-        "   item = what you need",
-        "   qty = how many",
-        "   reason = why you need it",
-        "   Example: HDMI cable, 2, Year-end concert booth",
-        "   You can also paste multiple lines at once (or rows copied from a spreadsheet).",
-        "",
-        "5) Wait for approval/rejection message.",
-        "6) If approved, open My loans and tap Sign / acknowledge.",
-        "7) Type your full name, then tap CONFIRM.",
-        "8) When returning gear, send /return with the transaction id "
-        "from the Sheet log or My loans. Logistics approves under Pending returns.",
-        "9) Need to change a pending request? Tap Edit a request.",
+        "Details (borrower)",
+        "• Unlock: session expires after about "
+        f"{config.SESSION_TTL_MINUTES} minute(s) of inactivity; send passcode again if needed.",
+        "• Line format: item, qty, reason (first two commas split fields; reason can contain commas).",
+        "• Spreadsheet paste: tab-separated rows also work.",
+        "• Wait for approval or rejection DM.",
+        "• Edit a pending request: tap Edit a request.",
         "",
         "Tips",
         "• If format is wrong, bot shows example again.",
@@ -778,12 +787,13 @@ def _help_text(*, include_admin: bool) -> str:
             [
                 "",
                 "— Logistics (you are an admin) —",
-                "• Pending loans — Approve / Reject; borrower is messaged either way.",
+                "• Pending loans — Approve / Reject; borrower is messaged after the sheet updates.",
                 "• /recordloan <id> or /rejectloan <id> — same as buttons, using Sheet id.",
-                "• Search /find — admins only (by Telegram id, club, keyword…).",
-                "• Pending returns — tap when gear is physically back.",
+                "• Search /find — look up rows instead of scrolling the Sheet.",
+                "• Pending returns — when gear is back; borrower gets a short thanks / closed DM.",
+                "• /pending — Queue counts (each tap still hits the Sheet once).",
+                "• Big bursts: the bot handles one Telegram update at a time — nothing 'crashes', but queues take longer to clear. Use Search; each row is still one Approve tap by design (audit trail).",
                 "• /adminlog — Show latest admin audit entries.",
-                "• /pending — Quick counts of pending queues.",
                 "• /backupnow — Create a timestamped backup sheet snapshot.",
             ]
         )
@@ -1069,7 +1079,10 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"- Pending loans: {pending_loans}\n"
         f"- Awaiting signatures: {awaiting_ack}\n"
         f"- Currently on loan: {on_loan}\n"
-        f"- Pending returns: {pending_returns}"
+        f"- Pending returns: {pending_returns}\n\n"
+        "Each number is from a full Sheet read — expect a short delay.\n"
+        "Under heavy load the bot still processes one action at a time; use Search (/find) "
+        "and work the queues row by row (one Approve tap per transaction by design)."
     )
 
 
@@ -1410,6 +1423,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         intro = (
             "You're unlocked.\n\n"
             "Reminder: My loans holds sign / acknowledge and returns.\n"
+            "Tip: paste many item lines in one go when requesting — fewer waits than one-by-one.\n"
+            "Replies can take a few seconds while the Google Sheet updates.\n"
             "Tap Help for the full guide.\n"
             + (
                 f"Operating hours: {_operating_hours_text()}\n"
@@ -1685,7 +1700,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["flow"] = USER_FLOW_GROUP
         try:
             await update.message.reply_text(
-                "Step 1/3: Pick your Group.",
+                "Pick your Group:",
                 reply_markup=_options_keyboard(list(CLUB_GROUPS.keys())),
             )
         except TelegramError:
@@ -1762,7 +1777,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["flow"] = USER_FLOW_CLUB
         try:
             await update.message.reply_text(
-                f"Step 2/3: Group selected: {text}\nNow pick your Club.",
+                f"Group: {text}\nPick your Club:",
                 reply_markup=_options_keyboard(list(CLUB_GROUPS[text]), include_back=True),
             )
         except TelegramError:
@@ -1796,7 +1811,7 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data["flow"] = USER_FLOW_DESC
         try:
             await update.message.reply_text(
-                f"Step 3/3: Enter what you need.\n{FORMAT_HELP}",
+                f"Last step — list what you need (format below).\n{FORMAT_HELP}",
                 reply_markup=_main_keyboard(uid),
             )
         except TelegramError:
@@ -1830,9 +1845,11 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Enforce per-CCA outstanding quantity limits from `limits` worksheet.
         try:
-            limits = await _sheet(sheets.get_item_limits, CRED, SHEET)
-            aliases = await _sheet(sheets.get_item_aliases, CRED, SHEET)
-            txs = await _sheet(sheets.list_transactions, CRED, SHEET)
+            limits, aliases, txs = await asyncio.gather(
+                _sheet(sheets.get_item_limits, CRED, SHEET),
+                _sheet(sheets.get_item_aliases, CRED, SHEET),
+                _sheet(sheets.list_transactions, CRED, SHEET),
+            )
         except SheetsBackendError:
             try:
                 await update.message.reply_text(SHEET_ERROR_TEXT)
@@ -1891,38 +1908,29 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
             projected[key] = new_total
 
-        tx_ids: list[str] = []
-        for item, qty, reason in rows:
-            tx_id = uuid.uuid4().hex
+        line_entries: list[tuple[str, str, str, str]] = [
+            (uuid.uuid4().hex, item, qty, reason) for item, qty, reason in rows
+        ]
+        try:
+            await _sheet(
+                sheets.append_requests_batch,
+                CRED,
+                SHEET,
+                requester_tg_id=uid,
+                requester_username=u.username or "",
+                requester_display_name=u.full_name or "",
+                cca=cca,
+                lines=line_entries,
+            )
+        except SheetsBackendError:
             try:
-                await _sheet(
-                    sheets.append_request,
-                    CRED,
-                    SHEET,
-                    tx_id=tx_id,
-                    requester_tg_id=uid,
-                    requester_username=u.username or "",
-                    requester_display_name=u.full_name or "",
-                    cca=cca,
-                    need_item=item,
-                    need_qty=qty,
-                    need_reason=reason,
+                await update.message.reply_text(
+                    f"{SHEET_ERROR_TEXT} Nothing was saved. Try again in a moment."
                 )
-            except SheetsBackendError:
-                try:
-                    if tx_ids:
-                        await update.message.reply_text(
-                            f"{SHEET_ERROR_TEXT} Saved {len(tx_ids)} item(s) before failure.\n"
-                            f"Saved IDs: {', '.join(tx_ids[:10])}"
-                        )
-                    else:
-                        await update.message.reply_text(
-                            f"{SHEET_ERROR_TEXT} No item was saved. Try again in a moment."
-                        )
-                except TelegramError:
-                    logger.exception("handle_user_text: append error reply failed")
-                return
-            tx_ids.append(tx_id)
+            except TelegramError:
+                logger.exception("handle_user_text: batch append error reply failed")
+            return
+        tx_ids = [e[0] for e in line_entries]
         context.user_data.pop("pending_cca", None)
         context.user_data.pop("pending_group", None)
         context.user_data.pop("flow", None)
@@ -1938,7 +1946,8 @@ async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await update.message.reply_text(
                     f"Saved {len(tx_ids)} requests.\n"
                     f"IDs: {shown}{extra}\n"
-                    "Logistics opens Pending loans to approve or reject each."
+                    "Logistics opens Pending loans to approve or reject each.\n\n"
+                    "Tip: sending several lines in one go is much faster than one message per item."
                 )
         except TelegramError:
             logger.exception("handle_user_text: success reply failed")
@@ -2224,7 +2233,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.pop("pending_ack_name", None)
         await _edit_callback_message(
             q,
-            "Step 1/2: Type your full name in chat as the next message.\n",
+            "Type your full name as the next message in this chat.\n",
         )
         if q.message:
             try:
@@ -2319,12 +2328,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except SheetsBackendError:
             await _edit_callback_message(q, SHEET_ERROR_TEXT)
             return
-        await _admin_audit(
-            context,
-            action="return_approved",
-            admin_user=u,
-            tx_id=tx_id,
-            notes="Approved return; marked transaction as returned",
+        cca = (t.get("cca") or "").strip() or "(CCA not set)"
+        loan_one = _fmt_loan_row(t)
+        short = tx_id[:10]
+        body = (
+            "✅ Thanks — logistics confirmed your return. "
+            "This loan is closed on our records.\n\n"
+            f"{loan_one}\n"
+            f"CCA: {cca}\n\n"
+            f"Reference id: {short}…"
+        )
+        await asyncio.gather(
+            _admin_audit(
+                context,
+                action="return_approved",
+                admin_user=u,
+                tx_id=tx_id,
+                notes="Approved return; marked transaction as returned; borrower notified",
+            ),
+            _maybe_dm_requester(context.bot, t.get("requester_tg_id"), body),
         )
         await _edit_callback_message(q, "Marked returned. Sheet updated.")
         return

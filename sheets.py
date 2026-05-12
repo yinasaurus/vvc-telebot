@@ -365,34 +365,27 @@ def ensure_workbook_extras(credentials_path: str, sheet_id: str) -> None:
     _ensure_aux_worksheet_headers(sh, ADMIN_AUDIT_SHEET_NAME, ADMIN_AUDIT_HEADERS)
 
 
-def append_request(
+def append_requests_batch(
     credentials_path: str,
     sheet_id: str,
     *,
-    tx_id: str,
     requester_tg_id: int,
     requester_username: str,
     requester_display_name: str,
     cca: str,
-    need_item: str,
-    need_qty: str,
-    need_reason: str,
+    lines: list[tuple[str, str, str, str]],
 ) -> None:
+    """
+    Append many pending loan rows in one Sheets API call and refresh collated_logs once.
+    Each tuple is (tx_id, need_item, need_qty, need_reason).
+    """
+    if not lines:
+        return
     ensure_headers(credentials_path, sheet_id)
     ws = _ws(credentials_path, sheet_id)
     now = now_iso()
-    row = [
-        tx_id,
-        now,
-        now,
-        str(requester_tg_id),
-        requester_username,
-        requester_display_name,
-        cca,
-        need_item,
-        need_qty,
-        need_reason,
-        STATUS_PENDING_ADMIN,
+    uid = str(requester_tg_id)
+    empty_tail = [
         "",  # loan_item
         "",  # loan_qty
         "",  # loan_reason
@@ -407,8 +400,50 @@ def append_request(
         "",  # return_approver_tg_id
         "",  # return_approver_username
     ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    batch_rows: list[list[str]] = []
+    for tx_id, need_item, need_qty, need_reason in lines:
+        batch_rows.append(
+            [
+                tx_id,
+                now,
+                now,
+                uid,
+                requester_username,
+                requester_display_name,
+                cca,
+                need_item,
+                need_qty,
+                need_reason,
+                STATUS_PENDING_ADMIN,
+                *empty_tail,
+            ]
+        )
+    ws.append_rows(batch_rows, value_input_option="USER_ENTERED")
     refresh_collated_logs(credentials_path, sheet_id)
+
+
+def append_request(
+    credentials_path: str,
+    sheet_id: str,
+    *,
+    tx_id: str,
+    requester_tg_id: int,
+    requester_username: str,
+    requester_display_name: str,
+    cca: str,
+    need_item: str,
+    need_qty: str,
+    need_reason: str,
+) -> None:
+    append_requests_batch(
+        credentials_path,
+        sheet_id,
+        requester_tg_id=requester_tg_id,
+        requester_username=requester_username,
+        requester_display_name=requester_display_name,
+        cca=cca,
+        lines=[(tx_id, need_item, need_qty, need_reason)],
+    )
 
 
 def parse_qty_number(raw: str) -> float:

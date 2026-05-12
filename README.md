@@ -6,17 +6,25 @@ Use this in **private chat** with the bot (not groups).
 
 ---
 
+## Responsiveness (lag, many requests, steps)
+
+- **Lag:** Most actions read or write **Google Sheets** over the network, so a short pause before the next bot message is normal. Loan approve/reject and return confirmation update the sheet first, then the borrower is messaged.
+- **Fewer waits for borrowers:** Paste **many** `item, qty, reason` lines in **one** message; the bot appends them in a **single batch** to the Sheet (one collated refresh), which is much faster than sending one item per message.
+- **Admins:** Each transaction still needs **its own Approve** tap (audit trail). Use **Search** (`/find`) instead of scrolling the Sheet. Under heavy load the bot handles **one Telegram update at a time** — queues take longer to clear, but the process does not “fall over” like an overloaded web form.
+
+---
+
 ## How it works (big picture)
 
 1. **Borrower** unlocks the bot with a shared passcode (session-based, and only during operating hours if enabled).
-2. **Borrower** creates a **New request**: pick **Group** and **Club** from buttons, then send **item, qty, reason** (see format below).
+2. **Borrower** creates a **New request**: pick **Group** and **Club** from buttons, then send one or more lines **`item, qty, reason`** (see format below; many lines can go in one message).
 3. A new row appears in the sheet with status **pending_admin**.
 4. **Admin** (logistics) opens **Pending loans** on the keyboard and taps **Approve** or **Reject** (or uses `/recordloan` / `/rejectloan`). Borrowers get a **Telegram DM** either way. Approve copies the request onto the loan columns and moves the row to awaiting signature.
 5. The sheet updates; status becomes **awaiting_user_ack**, with timestamps and admin Telegram identity recorded.
 6. **Borrower** opens **My loans** and taps **Sign / acknowledge**, enters full name, then types `CONFIRM`.
 7. Status becomes **on_loan**; borrower’s acknowledgement time is recorded.
 8. When returning: **Borrower** sends **`/return <transaction_id>`** (id from the Sheet log or My loans) → status **pending_return**.
-9. **Admin** uses **Pending returns** → approves → status **returned**, with approver and time recorded.
+9. **Admin** uses **Pending returns** → approves → status **returned**, with approver and time recorded; **borrower gets a Telegram DM** confirming the return.
 
 If a message does not match the required **three-part comma format**, the bot rejects it and shows the template again.
 
@@ -24,7 +32,7 @@ If a message does not match the required **three-part comma format**, the bot re
 
 1. Send passcode in private chat.
 2. Tap **New request**.
-3. Send: `item, qty, reason` (example: `HDMI cable, 2, rehearsal`)
+3. Send one or more lines: `item, qty, reason` per line (example: `HDMI cable, 2, rehearsal`). You can paste **many lines in one message** or copy rows from a spreadsheet (max 40 lines).
 4. Wait for logistics approval.
 5. If approved, open **My loans** and sign (name + `CONFIRM`).
 6. When returning, send `/return <tx_id>`.
@@ -71,7 +79,7 @@ flowchart TD
     L --> L1[Admin approves return]
     L1 --> L2[Update return approver + timestamp]
     L2 --> L3[status=returned]
-    L3 --> L4[Write admin_audit]
+    L3 --> L4[Write admin_audit + DM borrower]
 
     J --> J1[User picks editable request]
     J1 --> J2{Status editable?<br/>pending_admin or awaiting_user_ack}
@@ -96,7 +104,7 @@ flowchart TD
 
 ## Message format: `item, qty, reason`
 
-**Borrowers** submit **need** lines as **one message** per item with **three parts**, separated by the **first two commas**:
+**Borrowers** submit **need** lines as **one line per item**, **three parts** separated by the **first two commas**. A **single message** may contain **many lines** (batch paste); each line becomes one sheet row / transaction.
 
 - **Item** — what (trimmed).
 - **Qty** — how many / how much (trimmed; can be text like `2` or `1 set`).
@@ -106,6 +114,13 @@ Examples:
 
 - `HDMI cable, 2, Year-end concert booth`
 - `Mic set A, 1, Signed from store — backup for assembly` (comma inside the reason is OK)
+
+Batch in one message (each line = one request):
+
+```text
+HDMI cable, 2, Year-end concert booth
+Extension cord, 1, Stage setup
+```
 
 The bot stores **three columns each** for need and loan: `need_item`, `need_qty`, `need_reason`, and `loan_item`, `loan_qty`, `loan_reason`. On **Approve**, logistics copies **need→loan** (same wording) unless you edit the sheet manually later.
 
@@ -119,7 +134,7 @@ The bot stores **three columns each** for need and loan: `need_item`, `need_qty`
 | Decline request | Admin | **Reject**, or `/rejectloan <tx_id>` | Status → `cancelled`; **DMs borrower** |
 | Sign / acknowledge receipt | Borrower | **My loans** → **Sign / acknowledge** → full name + `CONFIRM` | Sets `user_ack_at`, `ack_full_name`, `ack_method`, status → `on_loan` |
 | Start return | Borrower | **`/return <tx_id>`** — paste id from Sheet log or **My loans** | Sets `return_requested_at`, status → `pending_return` |
-| Approve return | Admin | **Pending returns** → button | Sets `return_approved_*`, status → `returned` |
+| Approve return | Admin | **Pending returns** → button | Sets `return_approved_*`, status → `returned`; **DMs borrower** (thanks / closed) |
 
 Use **`/admin`** in Telegram for a short reminder (admins only).
 
